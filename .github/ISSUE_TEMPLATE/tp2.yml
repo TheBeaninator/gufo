@@ -9,7 +9,7 @@ body:
         only problems with that here. Anything that also happens on a single
         host belongs [upstream](https://github.com/gufo-org/gufo/issues).
 
-        Setup notes are in [TP2.md](https://github.com/neuhaus/gufo/blob/rdma/docs/models/qwen3.8-flash-next/TP2.md).
+        Setup notes are in [TP2.md](https://github.com/neuhaus/gufo/blob/rdma/docs/internal/models/qwen3.8-flash-next/TP2.md).
   - type: checkboxes
     id: scope
     attributes:

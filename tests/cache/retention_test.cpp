@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -190,6 +191,55 @@ void RanksAndSources() {
     assert(g.policy.Rank(a) == 3);  // image identities never cover each other
   }
 }
+void ReusedExactRetryOutlivesAnUnrelatedColdRetry() {
+  Fixture f;
+  f.Add({1, 2, 3});
+  const auto retry = f.Add({1, 2, 3, 4}, RetentionPurpose::kRetry, 3);
+  assert(f.policy.Rank(retry) == 0);
+  f.policy.Touch(retry);
+  assert(f.policy.Rank(retry) == 3);
+  const std::vector<Token> other{9, 10, 11};
+  RetentionRequest request{other, {1}, {}, RetentionPurpose::kRetry};
+  assert(!f.policy.Reclaim(request));
+  assert(f.Cached({1, 2, 3, 4}) == 4);
+}
+void ReusedExactRetryYieldsToItsOwnContinuation() {
+  // Reuse protection does not pin a retry against the history it started:
+  // a continuation extending the exact prompt still replaces it first.
+  Fixture f;
+  f.Add({1, 2, 3});
+  const auto retry = f.Add({1, 2, 3, 4}, RetentionPurpose::kRetry, 3);
+  f.policy.Touch(retry);
+  assert(f.policy.Rank(retry) == 3);
+  const std::vector<Token> longer{1, 2, 3, 4, 5};
+  RetentionRequest request{longer, {1}, {}, RetentionPurpose::kContinuation};
+  assert(f.policy.Reclaim(request));
+  assert(f.log.events.back().action == RetentionAction::kRemoved);
+  assert(f.log.events.back().checkpoint == retry);
+  assert(f.Cached({1, 2, 3, 4}) == 3);
+}
+void SharedGridBeforeTheActualDivergenceIsAFork() {
+  Fixture f;
+  const std::vector<Token> root(8, 7);
+  const auto grid = f.Add(root, RetentionPurpose::kHistory);
+  auto left = root;
+  left.insert(left.end(), 8, 8);
+  auto right = left;
+  left.push_back(9);
+  right.push_back(10);
+  const auto a = f.Add(left);
+  const auto b = f.Add(right);
+  assert(f.policy.Rank(grid) == 3);
+  // A normal retry cannot remove the only common fallback for compaction.
+  RetentionRequest retry{left, {1}, {}, RetentionPurpose::kRetry};
+  retry.reused = true;
+  retry.reused_tokens = root.size();
+  retry.source = grid;
+  assert(!f.policy.Reclaim(retry));
+  f.policy.Remove(a);
+  assert(f.policy.Rank(grid) == 1);
+  f.policy.Remove(b);
+}
 void LongPrefixRelationsAfterReplacement() {
   Fixture f(4);
   const std::vector<Token> prefix(131072, 7);
@@ -307,9 +357,10 @@ struct PressureFixture {
   // reclaims through the byte-pressure order when the ledger is full.
   CheckpointId Add(std::vector<Token> tokens,
                    RetentionPurpose purpose = RetentionPurpose::kContinuation,
-                   bool reused = false) {
+                   bool reused = false, std::uint64_t turn = 0) {
     RetentionRequest request{tokens, {1}, {}, purpose};
     request.reused = reused;
+    request.turn = turn;
     assert(policy.Admit(request, [&] {
       return IndexCheckpoint(ledger, tokens, {1}, {}, kPressureComponents);
     }));
@@ -614,6 +665,37 @@ void ForkedParentOutlivesItsChildren() {
   assert(f.Cached(parent) == 12);
   assert(f.Reclaim() == fork);
 }
+void ReusedRetryProtectionExpiresAfterOneTurnover() {
+  // A restored exact retry stays protected for one RAM-budget turnover of
+  // newly admitted bytes, then becomes a disposable retry copy again.
+  constexpr std::size_t kRam = 64 * 1024;
+  PressureFixture f(kRam);
+  f.Add({1, 2, 3});
+  const std::vector<Token> exact{1, 2, 3, 4};
+  RetentionRequest request{exact, {1}, {}, RetentionPurpose::kRetry, 3};
+  assert(f.policy.Admit(request, [&] {
+    return IndexCheckpoint(f.ledger, exact, {1}, {}, kPressureComponents);
+  }));
+  const auto retry = f.log.events.back().checkpoint;
+  assert(f.policy.Rank(retry) == 0);
+  f.policy.Touch(retry);
+  Token next = 100;
+  std::size_t admitted = 0;
+  constexpr std::size_t kRequest = 4096 + 16 * 64;
+  // Retiring each newer conversation keeps the ledger below its limit, so
+  // only the byte clock, not pressure eviction, ages the protection.
+  while (admitted + kRequest < kRam) {
+    assert(f.policy.Rank(retry) == 3);
+    f.policy.Remove(f.Add(Conversation(next++, 16)));
+    admitted += kRequest;
+  }
+  while (admitted < 2 * kRam) {
+    f.policy.Remove(f.Add(Conversation(next++, 16)));
+    admitted += kRequest;
+  }
+  assert(f.policy.Rank(retry) == 0);
+  assert(f.Cached(exact) == 4);
+}
 void ReuseProtectionLastsOneTurnover() {
   // A reused conversation outlives newer one-use requests (cache-pressure UI
   // tasks) for one turnover of the RAM budget, then ages out like any other.
@@ -672,6 +754,28 @@ void RecordSourceReplacement() {
   assert(f.policy.Rank(source) == 2);
 }
 void FullOptionalExactReplacement() {
+  for (const auto purpose :
+       {RetentionPurpose::kRetry, RetentionPurpose::kHistory}) {
+    Fixture f(4);
+    const std::vector<Token> root{1, 2};
+    const auto id = f.Add(root);
+    f.Add({1, 2, 3});
+    f.Add({1, 2, 4});
+    f.Add({9, 9});
+    for (int i = 0; i < 4; ++i)
+      f.policy.Touch(id);
+    assert(f.policy.Rank(id) == 3);
+    // The stale unrelated conversation permits optional admission, but an
+    // exact replacement must preserve this freshly used inferred fork.
+    assert(f.policy.Admit({root, {1}, {}, purpose, 0, id},
+                          [&] { return IndexCheckpoint(f.ledger, root); }));
+    const auto replacement = f.log.events.back().checkpoint;
+    assert(f.log.events.back().purpose == RetentionPurpose::kBranchPoint);
+    assert(f.policy.Rank(replacement) == 3);
+    assert(f.policy.Size() == 4 && f.Cached({9, 9, 1}) == 2);
+    f.Add({8, 8});
+    assert(f.Cached({1, 2, 5}) == 2);
+  }
   for (const auto purpose :
        {RetentionPurpose::kRetry, RetentionPurpose::kHistory}) {
     for (const std::size_t limit : {1U, 2U}) {
@@ -1199,10 +1303,106 @@ void WindowPeersAlignByRow() {
   }
   assert(ledger.Snapshot().total_bytes == 0);
 }
+void RecordTurnoverAdmitsOptionalCopies() {
+  // Small checkpoints fill every record before byte pressure. A conversation
+  // unused for one record-table turnover then gives way to an optional copy;
+  // a retained descendant's use keeps its ancestors.
+  for (const auto purpose :
+       {RetentionPurpose::kRetry, RetentionPurpose::kHistory}) {
+    Fixture f(4);
+    f.Add({1, 2});
+    const auto child = f.Add({1, 2, 3});
+    f.Add({7, 7});
+    const auto last = f.Add({8, 8});
+    const auto admit = [&](std::vector<Token> tokens,
+                           RetentionPurpose purpose) {
+      return f.policy.Admit({tokens, {1}, {}, purpose},
+                            [&] { return IndexCheckpoint(f.ledger, tokens); });
+    };
+    assert(!admit({9, 9, 9}, purpose));
+    assert(f.log.events.back().reason == RetentionReason::kRecordCapacity);
+    for (int i = 0; i < 2; ++i) {
+      f.policy.Touch(child);
+      f.policy.Touch(last);
+    }
+    assert(admit({9, 9, 9}, purpose));
+    assert(f.Cached({7, 7, 1}) == 0 && f.Cached({1, 2, 5}) == 2);
+    assert(f.Cached({1, 2, 3, 4}) == 3 && f.Cached({8, 8, 1}) == 2);
+    const auto removed = f.log.events[f.log.events.size() - 2];
+    assert(removed.action == RetentionAction::kRemoved &&
+           removed.reason == RetentionReason::kRecordCapacity);
+    // Every remaining conversation was used within the last turnover.
+    assert(!admit({6, 6, 6}, RetentionPurpose::kHistory));
+    assert(f.policy.Size() == 4);
+  }
+}
+void RecentCoveredTurnsSurviveOlderHistory() {
+  PressureFixture f;
+  const auto whole = Conversation(1, 32);
+  const auto add = [&](std::size_t n, std::uint64_t turn) {
+    return f.Add({whole.begin(), whole.begin() + n},
+                 RetentionPurpose::kContinuation, true, turn);
+  };
+  const auto old = add(8, 1);
+  // Three captures within one turn do not expire the preceding edit fallback.
+  const auto previous = add(12, 2);
+  add(16, 3);
+  add(20, 3);
+  add(24, 3);
+  assert(f.Reclaim() != previous);
+  // Another completed turn supersedes turn 1, before the two recent turns.
+  add(28, 4);
+  assert(f.Reclaim() == old);
+  auto edit = whole;
+  edit[13] += 1;
+  assert(f.Cached(edit) == 12);
+}
+void PressureDemotionRespectsDiskOptOut() {
+  PressureFixture f;
+  const auto tokens = Conversation(1, 16);
+  RetentionRequest request{tokens, {1}, {}};
+  request.persistable = false;
+  assert(f.policy.Admit(request, [&] {
+    return IndexCheckpoint(f.ledger, tokens, {1}, {}, kPressureComponents);
+  }));
+  const auto opted_out = f.log.events.back().checkpoint;
+  const auto allowed = f.Add(Conversation(2, 16));
+  std::shared_ptr<const Checkpoint> demoted;
+  f.policy.SetDemotion(
+      [&](auto checkpoint) { demoted = std::move(checkpoint); });
+  assert(f.Reclaim() == opted_out && !demoted);
+  assert(f.Reclaim() == allowed && demoted && demoted->Id() == allowed);
+  assert(f.Cached(Conversation(2, 16)) == 0);
+  demoted.reset();
+}
+void CostIntervals() {
+  const CostEstimate cost{0.001, 0.002, 96e9, 3.3e9};
+  const auto first = cost.PrefillSeconds(0, 50000);
+  const auto second = cost.PrefillSeconds(50000, 100000);
+  assert(std::abs(first - 75) < 1e-12);
+  assert(std::abs(second - 125) < 1e-12);
+  assert(cost.PrefillSeconds(0, 100000) == first + second);
+  assert(cost.PrefillSeconds(100000, 100000) == 0);
+  assert(cost.RestoreSeconds(3300000000ULL, true) == 1);
+  assert(cost.RestoreSeconds(96000000000ULL, false) == 1);
+  bool rejected = false;
+  try {
+    (void)cost.PrefillSeconds(9, 8);
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  assert(rejected);
+}
 int main() {
+  CostIntervals();
+  PressureDemotionRespectsDiskOptOut();
+  RecentCoveredTurnsSurviveOlderHistory();
   Planning();
   Branches();
   RanksAndSources();
+  ReusedExactRetryOutlivesAnUnrelatedColdRetry();
+  ReusedExactRetryYieldsToItsOwnContinuation();
+  SharedGridBeforeTheActualDivergenceIsAFork();
   LongPrefixRelationsAfterReplacement();
   ShortPeersDoNotCoverHistory();
   HistoryBytePressureCanReplaceOldFamilies();
@@ -1216,6 +1416,7 @@ int main() {
   SharedShortPrefixIsNotCheap();
   UnreusedConversationKeepsItsStem();
   ForkedParentOutlivesItsChildren();
+  ReusedRetryProtectionExpiresAfterOneTurnover();
   ReuseProtectionLastsOneTurnover();
   RecordSourceReplacement();
   FullOptionalExactReplacement();
@@ -1227,4 +1428,5 @@ int main() {
   InvalidInventoriesPreserveReplacement();
   WindowPeersAlignByRow();
   ShortWindowCheckpointsAreCheap();
+  RecordTurnoverAdmitsOptionalCopies();
 }

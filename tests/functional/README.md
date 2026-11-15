@@ -4,12 +4,13 @@ The runners start isolated local servers and check real HTTP responses. Manual
 suites use production binaries and local weights. Devlab CI downloads only its
 selected models from pinned revisions.
 
-## Embedding, ASR and TTS service checks
+## Embedding, ASR, TTS and image service checks
 
 `model_services.py` starts an isolated loopback production server, checks readiness
 and advertised model identity, runs real HTTP inference, and shuts down its owned
 process. These suites are explicit and separate from the text runner's `--suite all`.
 They do not download weights or voice recordings. Missing inputs fail the run.
+`--model` is a snapshot directory or a single model file, such as a GGUF.
 Use `nix develop`, or install `tests/functional/requirements.txt` in a virtualenv.
 Build the production binary with `cmake --preset release` and
 `cmake --build --preset release --parallel 4` inside the pinned development shell.
@@ -28,7 +29,21 @@ nix develop -c python3 tests/functional/model_services.py tts \
   --variant base \
   --asr-binary /path/to/pinned/gufo --asr-model models/audio/Qwen3-ASR-1.7B \
   --output artifacts/model-services/tts-base-1
+
+nix develop -c python3 tests/functional/model_services.py image \
+  --binary build/release/gufo --model models/Qwen-Image-2.1 \
+  --lora voxel=models/loras/Qwen-Image-2.1-Voxel-Style-3000.safetensors \
+  --lora clay=models/loras/Qwen-Image-2.1-Clay-Sculpture-Style-3000.safetensors \
+  --lora-default clay:0.5 --output artifacts/model-services/image-1
 ```
+
+Image takes the complete Qwen-Image-2.1 or Turbo snapshot. `--image-suite smoke`
+(Devlab's PR tier) stops after discovery, OpenAI/sdapi parity, seeded replay, one
+`/v1/images/edits` request with a reference image, and error recovery; the default `full` adds guidance, image to image, batches, client
+payloads and API separation. Pass two `--lora`
+adapters and a `--lora-default` to cover adapter selection; without them the
+LoRA case is skipped and recorded as not run, so run it with adapters for
+changes to adapter handling.
 
 Embedding uses `--embedding-suite smoke` by default, including Devlab's PR tier.
 It retains independent reference-vector checks for all four modalities in one
@@ -52,7 +67,8 @@ VoiceDesign model (fixed English voice instructions). Neither requires a clone.
 | --- | --- |
 | Embedding | The default three-request smoke check covers text, image, video, mixed video/audio/image input, malformed-video rejection and recovery. `--embedding-suite full` retains the text, image, audio and video HTTP suites: independent reference vectors, dimensions, normalization, encodings, batch ordering, concurrent requests, image/audio formats, multiple clips, audio/text/image interleaving, ignored unknown members, llama.cpp `content`/`embd_normalize`, invalid inputs, cancellation and recovery |
 | ASR | English transcript WER ≤ 0.15, exact greedy replay, JSON/text/verbose formats, complete SSE matching buffered output, concurrent speech/silence, ignored unknown fields, rejected options (including timestamps and logprobs), malformed WAV recovery, stream cancellation and subsequent valid inference |
-| TTS | Voice discovery, valid non-silent 24-kHz mono PCM16 audio, two fixed texts with ASR WER ≤ 0.25, exact same-seed warm replay, WAV/PCM/SSE equality, different concurrent texts/seeds, ignored unknown fields, rejected inputs, stream cancellation and subsequent valid inference |
+| Image | 512 × 512, 8 steps. `--image-suite smoke` keeps discovery, parity, replay, one reference edit, errors and recovery. OpenAI SDK generation equals sdapi `txt2img` pixel for pixel and replays; `cfg_scale` equals `guidance_scale`, and a negative prompt alone stays unguided on both APIs; `lora` defaults, `[]`, two adapters and repeated paths equal their OpenAI `loras`, with unknown and missing paths refused; `img2img` equals `image` + `strength`, including the 0.75 default strength and the init image's size; `batch_size` equals `n`; Open WebUI and SillyTavern request bodies; neither API reads the other's fields; sdapi `{"error"}` and OpenAI error shapes; discovery routes and recovery |
+| TTS | Voice discovery, valid non-silent mono PCM16 audio at the sample rate of the server's WAV responses, two fixed texts with ASR WER ≤ 0.25, exact same-seed warm replay, WAV/PCM/SSE equality, different concurrent texts/seeds, ignored unknown fields, rejected inputs, stream cancellation and subsequent valid inference |
 
 Audio cancellation must appear against the cancelled request's ID in the server
 log; a client closing a response alone does not satisfy the assertion. SSE must
@@ -80,10 +96,15 @@ and speaker-similarity scoring remain separate coverage.
 Devlab speed comparisons use a pinned main revision and candidate, matching the
 runner, toolchain, weights, settings and request histories. `service_phases.py`
 uses server-emitted request timings and work counters: ASR `Server-Timing`
-phases, TTS synthesis time and codec/audio work, and embedding request duration
+phases, TTS synthesis time and codec/audio work, image prompt encoding, denoising
+and VAE decoding with the size and step count (a first image, which loads the
+weights, and a warm replay), and embedding request duration
 and token/input counts. Client latency and first-output observations remain
 separate. Each request and phase retains every paired repeat at the existing
-5% and 3-ms thresholds; mismatched work stays inconclusive.
+5% and 3-ms thresholds; mismatched work stays inconclusive. NPU models
+(`*-npu` in `devlab.json`) serve both arms with `--npu`, and an arm whose NPU
+programs fall back to a slower path fails. A base without `--npu` runs no arm;
+the candidate's NPU timings are then retained as unchecked observations.
 
 Repeat with fresh output directories to check stability. Preserve failed attempts
 alongside successful runs. CPU checks for metric and incomplete-stream refusal:
@@ -195,7 +216,7 @@ nix develop -c python3 tests/functional/generation_quality.py \
 The reports contain `code` and `code-think` entries from `chat_result`, including
 text and finish reason. This executes the reviewed generated Python on the
 development host. The requests and measurement scope are recorded in the
-[Qwen27B quality notes](../../docs/models/qwen3.8-27b/QUALITY.md#october-21-coding-and-prose-follow-up).
+[Qwen27B quality notes](../../docs/internal/models/qwen3.8-27b/QUALITY.md#october-21-coding-and-prose-follow-up).
 
 `prompt_lookup_workflows.py` checks extraction, generated URI tests and edits
 after a long source archive against an already running Flash-Next MTP server:
@@ -297,9 +318,9 @@ Selections from separate paths are combined:
 | Private Qwen27 implementation | Qwen27 Q4/DFlash2 |
 | Private DeepSeek implementation | DeepSeek V4/DSpark |
 | Shared LLM and private DeepSeek code | Flash-Next and DeepSeek |
-| Embedding, ASR or TTS code | That category's representative |
+| Embedding, ASR, TTS or image generation code | That category's representative |
 | Shared infrastructure or unmapped paths | One representative per supported category |
-| Documentation, image generation or H3-only paths | No GPU job in this workflow |
+| Documentation or H3-only paths | No GPU job in this workflow |
 
 Models listed under `disabled` in `devlab.core.json`, with a reason, are left
 out of the plan and named in the report. Remove the entry to restore the model.
@@ -311,7 +332,9 @@ suites still assume Flash-Next checkpoint sizes and Qwen token counts.
 
 The embedding and ASR representatives are EmbeddingGemma 2 and Qwen3-ASR. TTS
 uses Base cloning in the PR tier; the full tier exercises Base, CustomVoice and
-VoiceDesign. Manual `ar` adds the selected LLMs' AR profiles. The existing manual
+VoiceDesign. Image generation uses Qwen-Image-2.1-Turbo in the PR tier; the full
+tier runs the full image suite on both Turbo and Qwen-Image-2.1. All requests use
+512 × 512 and eight steps, without LoRA adapters, so the LoRA case is recorded as not run. Manual `ar` adds the selected LLMs' AR profiles. The existing manual
 `benchmark` option adds Flash-Next and its main/candidate AR depth sweep.
 Qwen27 Q8 remains an explicit manual functional qualification outside this bounded
 CI selection. Numerical and agent-replay obligations outside the selected suites
@@ -455,9 +478,26 @@ only affected suites. Reuse matching baseline evidence; do not repeat the whole
 correctness matrix on main. A baseline must match the revision, harness,
 toolchain, weights, settings and preceding cache history.
 
-Use `deepseek4` for DeepSeek. Pass the model's normal speculative options for
+Use `deepseek4` for DeepSeek. For another model, such as one an extension
+serves, use `provider`: `sampling-defaults` then expects the defaults the
+server reports in `/props`, in both thinking modes, and writes the thinking
+mode instead of a preset's default effort. Qwen-only assertions, such as the
+literal marker `tool-edges` requires before a call, are recorded rather than
+required. Pass the model's normal speculative options for
 DFlash2, MTP or DSpark. Server sampling arguments become the expected defaults;
 `--mmproj` enables image cases. Keep informational server logging enabled.
+
+Without `--context`, the runner starts the server with 8192 tokens, or with
+the most a selected suite needs: 65536 for `cache-stalls`, 32768 for
+`cache-depth` (so for `all`), `cache-transforms` and `cache-pressure`, and 16384 for
+`cache-shared-prefix`, `cache-compaction`, `cache-messages-loop` and
+`prefill-scheduling`. A smaller explicit `--context` is refused before the
+server starts, as is `cache-bridge` or `cache-pressure` without
+`--cache-ram-bytes`. When their background requests cannot fill that budget,
+their unqualified result suggests a smaller one from the bytes they published;
+checkpoints can shrink under a smaller budget, so it may take another step.
+LFM3 1.7B fills 268435456 bytes for `cache-bridge` and 134217728 for
+`cache-pressure`.
 
 Each invocation tests **one model and one mode**. Model-specific changes need
 only the affected target/modes. For shared text changes, run the affected suites
@@ -562,7 +602,7 @@ model must not qualify the image suite by skipping its assertions.
 
 `image-detail` also requires `--mmproj`. Each of its two requests leaves a new
 stable boundary in the RAM cache. Retry copies cannot displace stable
-boundaries, as [KV-CACHE.md](../../docs/KV-CACHE.md) describes, so in a full
+boundaries, as the [cache reference](../../docs/internal/cache.md) describes, so in a full
 cache these two boundaries can make a later unchanged retry prefill its
 assistant opening again. Select `image-detail` after `image-count`, whose
 unchanged retries expect full reuse.
@@ -750,7 +790,7 @@ and continues the compacted conversation. Cold controls run after every warm
 request. The seed is a genuine model reply; tool calls/results and the summary
 are deterministic client-authored fixtures. This covers compaction mechanics,
 not a real client's summary generation or retention under RAM/disk pressure.
-The [card 01 results](../../docs/cache-redesign/cards/01-functional-coverage.md#results)
+The [card 01 results](https://github.com/gufo-org/gufo/blob/0fb50ce436044a9687c78635e7afbc2bb65fc6f4/docs/cache-redesign/cards/01-functional-coverage.md#results)
 record all scenario families.
 
 Run `cache-transforms` with a roomy RAM budget in its own invocation. Its
@@ -910,7 +950,7 @@ Reports and logs survive failures. These checks complement the standard speed
 benchmark and numerical quality tests; they do not establish upstream model
 parity. Sampled DSpark may differ across concurrency levels; fixed-path replay
 and greedy equality remain checked. API behavior and references are in
-[SERVER.md](../../docs/SERVER.md).
+[server reference](../../docs/internal/server.md).
 
 For an already running TP2 pair, `tp2_constraints.py` checks automatic and
 required tools, JSON schemas, streaming, concurrent constraints and a mixed

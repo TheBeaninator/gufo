@@ -377,6 +377,16 @@ void Model::LimitCopyRows(std::uint32_t rows) noexcept {
   executor_->LimitCopyRows(rows);
 }
 
+void Model::SetPrefillYield(std::size_t groups,
+                            std::function<void()> yield) const {
+  if (groups < 2 || !yield) {
+    executor_->SetLayerHook({}, {});
+    return;
+  }
+  executor_->SetLayerHook(executor_->LayerHookBoundaries(groups),
+                          std::move(yield));
+}
+
 std::size_t Session::AllocatedBytes() const noexcept {
   return session_->AllocatedBytes();
 }
@@ -1095,6 +1105,7 @@ struct Session::PendingDecode {
   std::int32_t draft{0};
   bool draft_subset{false};  ///< this cycle drafts through the subset head
   bool sampled_subset_cost{false};
+  bool planned_greedy{false};
   /// Trailing chain tokens copied by prompt lookup (after the MTP drafts).
   std::uint32_t lookup{0};
   /// Committed index the copied tokens were taken from.
@@ -1213,6 +1224,13 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       batch_drafts.has_value(), occupancy);
   // A peer's plan fixes the maximum width on both ranks.
   const auto& forced = request.drafts ? request.drafts : batch_drafts;
+  pending->planned_greedy =
+      forced.has_value() && !sampler.config().uses_random_sampling();
+  // Every chain ends after its first proposal below the gate (greedy: the
+  // head's confidence, read back with each draft token in every path;
+  // sampled: host-side q). An unplanned cycle drafts to its budget; a jointly
+  // planned greedy batch keeps the planned width as its cap. The controller
+  // still backs off to AR.
   std::uint32_t drafts = 0;
   if (MtpEnabled() && cap > 1) {
     drafts = forced ? std::min<std::uint32_t>(*forced, cap - 1)
@@ -1565,9 +1583,10 @@ bool Session::FinishDecode(const DecodeRequest& request,
   const std::uint32_t observed = mtp_all ? keep - 1 : mtp_accepted;
   // A target stop ends the request; it does not classify the remaining
   // proposals as failed predictions.
-  draft_length_.Observe(
-      observed, result->stop || mtp_all ? observed : mtp_drafts, base,
-      pending.policy_concurrency, pending.sampled_subset_cost);
+  draft_length_.Observe(observed,
+                        result->stop || mtp_all ? observed : mtp_drafts, base,
+                        pending.policy_concurrency, pending.sampled_subset_cost,
+                        pending.planned_greedy);
 
   // The next call knows the next sampled anchor. Defer draft catch-up until
   // then, retaining this session's target hidden rows across interleaving.

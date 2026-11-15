@@ -103,11 +103,20 @@ if(ENGINE_ENABLE_HIP)
     GUFO_DS4_BOUNDARY_PROMPT="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/indexer-boundary-prompt.txt"
     GUFO_DS4_OFFICIAL_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/official-0731.json"
     GUFO_CHAT_TEMPLATE_HF_GOLDENS="${PROJECT_SOURCE_DIR}/tests/fixtures/chat_template_hf_goldens.json")
-  target_link_libraries(ds4_quality_test PRIVATE gufo_deepseek_v4_flash_hip hip::host)
+  target_link_libraries(ds4_quality_test PRIVATE gufo_deepseek_v4_flash_hip hip::host
+    OpenSSL::Crypto)
   add_test(NAME ds4.target COMMAND ds4_quality_test)
   add_test(NAME ds4.dspark COMMAND ds4_quality_test --dspark)
   set_tests_properties(ds4.target ds4.dspark PROPERTIES
     LABELS "gpu;hip;gfx1151;ds4;quality;external-model;slow"
+    RESOURCE_LOCK ds4_model
+    SKIP_RETURN_CODE 77)
+
+  add_executable(ds4_dspark_verify_test dspark_verify_test.cpp)
+  target_link_libraries(ds4_dspark_verify_test PRIVATE gufo_deepseek_v4_flash_hip)
+  add_test(NAME ds4.dspark_verify COMMAND ds4_dspark_verify_test)
+  set_tests_properties(ds4.dspark_verify PROPERTIES
+    LABELS "gpu;hip;gfx1151;ds4;quality;external-model"
     RESOURCE_LOCK ds4_model
     SKIP_RETURN_CODE 77)
 
@@ -119,6 +128,18 @@ if(ENGINE_ENABLE_HIP)
   set_tests_properties(ds4.continuation_adapter PROPERTIES
     LABELS "gpu;hip;ds4;cache;external-model;slow"
     RESOURCE_LOCK ds4_model
+    SKIP_RETURN_CODE 77)
+
+  # Layered prefill (SetPrefillYield) against lone runs, autoregressive.
+  add_executable(ds4_layered_prefill_test layered_prefill_test.cpp)
+  target_link_libraries(ds4_layered_prefill_test PRIVATE
+    gufo_deepseek_v4_flash_hip gufo_test_support)
+  add_test(NAME ds4.layered_prefill COMMAND ds4_layered_prefill_test)
+  set_tests_properties(ds4.layered_prefill PROPERTIES
+    LABELS "gpu;hip;ds4;external-model;slow"
+    RESOURCE_LOCK ds4_model
+    RUN_SERIAL TRUE
+    TIMEOUT 1800
     SKIP_RETURN_CODE 77)
 
   add_executable(ds4_serving_test serving_test.cpp)
@@ -147,7 +168,8 @@ if(ENGINE_ENABLE_HIP)
   add_executable(ds4_projection_test projection_test.hip moe_test.hip)
   target_include_directories(ds4_projection_test SYSTEM PRIVATE ${ROCWMMA_INCLUDE_DIR})
   target_include_directories(ds4_projection_test PRIVATE ${PROJECT_SOURCE_DIR})
-  target_compile_options(ds4_projection_test PRIVATE -O3 -ffast-math -fno-finite-math-only)
+  target_compile_options(ds4_projection_test PRIVATE -O3 ${GUFO_CLANG_OPTION}-ffast-math
+    ${GUFO_CLANG_OPTION}-fno-finite-math-only)
   target_link_libraries(ds4_projection_test PRIVATE hip::host)
   add_test(NAME ds4.projections COMMAND ds4_projection_test)
   set_tests_properties(ds4.projections PROPERTIES
@@ -159,7 +181,8 @@ if(ENGINE_ENABLE_HIP)
   target_include_directories(ds4_attention_test PRIVATE ${PROJECT_SOURCE_DIR})
   target_include_directories(ds4_attention_test SYSTEM PRIVATE
     ${HIPCUB_INCLUDE_DIR} ${ROCPRIM_INCLUDE_DIR} ${ROCWMMA_INCLUDE_DIR})
-  target_compile_options(ds4_attention_test PRIVATE -O3 -ffast-math -fno-finite-math-only)
+  target_compile_options(ds4_attention_test PRIVATE -O3 ${GUFO_CLANG_OPTION}-ffast-math
+    ${GUFO_CLANG_OPTION}-fno-finite-math-only)
   target_link_libraries(ds4_attention_test PRIVATE hip::host)
   add_test(NAME ds4.attention COMMAND ds4_attention_test)
   set_tests_properties(ds4.attention PROPERTIES

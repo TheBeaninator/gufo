@@ -17,11 +17,17 @@ public:
       const ext::ImageRequest& request,
       const ext::CancellationCheck& is_cancelled) override {
     Request req{
-        .prompt = request.prompt,
+        .prompt = ConditionPrompt(request.prompt, request.background),
         .width = request.width,
         .height = request.height,
         .steps = request.steps,
         .seed = request.seed,
+        .background = request.background,
+        .loras = request.loras,
+        .negative_prompt = request.negative_prompt,
+        .guidance_scale = request.guidance_scale,
+        .init_image = request.init_image,
+        .strength = request.strength,
     };
     req.images.reserve(request.images.size());
     for (const auto& img : request.images) {
@@ -43,9 +49,26 @@ public:
                 .total_ms = result.metrics.total_ms,
                 .resident_weight_bytes = result.metrics.resident_weight_bytes,
                 .steps = result.metrics.steps,
+                .lora_ms = result.metrics.lora_ms,
+                .guidance_scale = result.metrics.guidance_scale,
             },
     };
   }
+
+  std::optional<ext::ImageCapabilities> Capabilities() const override {
+    return kCapabilities;
+  }
+
+  ext::ImageLoraInfo AddLora(const std::string& name,
+                             const std::string& path) override {
+    return model_->AddLora(name, path);
+  }
+
+  std::vector<ext::ImageLora> ActiveLoras() const override {
+    return model_->ActiveLoras();
+  }
+
+  bool DeviceLost() const override { return model_->DeviceLost(); }
 
 private:
   std::unique_ptr<Model> model_;

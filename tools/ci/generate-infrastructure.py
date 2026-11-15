@@ -188,10 +188,10 @@ def generate_check_docs(root: Path, manifests: List[Dict[str, Any]]) -> str:
         docs = manifest.get("docs")
         if docs and "guide" in docs:
             guide_path = docs["guide"]
-            # e.g. "docs/models/deepseek-v4-flash/README.md" -> "deepseek-v4-flash"
+            # e.g. "docs/models/deepseek-v4-flash.md" -> "deepseek-v4-flash"
             parts = Path(guide_path).parts
-            if len(parts) >= 3 and parts[0] == "docs" and parts[1] == "models":
-                model_dirs.add(parts[2])
+            if len(parts) == 3 and parts[0] == "docs" and parts[1] == "models":
+                model_dirs.add(Path(parts[2]).stem)
 
     sorted_dirs = sorted(model_dirs)
     dir_strings = [f'"{d}"' for d in sorted_dirs]
@@ -204,10 +204,12 @@ def generate_check_docs(root: Path, manifests: List[Dict[str, Any]]) -> str:
     tuple_content = ",\n                    ".join(lines)
     if len(dir_strings) == 1:
         tuple_content += ","
+    models = f"({tuple_content})"
     block = (
-        '    *[f"docs/models/{model}/{document}.md"\n'
-        + f"      for model in ({tuple_content})\n"
-        + '      for document in ("README", "BENCHMARKS", "QUALITY", "EXPERIMENTS")],'
+        f'    *[f"docs/models/{{model}}.md"\n      for model in {models}],\n'
+        + '    *[f"docs/internal/models/{model}/{document}.md"\n'
+        + f"      for model in {models}\n"
+        + '      for document in ("BENCHMARKS", "QUALITY", "EXPERIMENTS")],'
     )
 
     return replace_marked_block(
@@ -241,9 +243,9 @@ def generate_models_readme(root: Path, manifests: List[Dict[str, Any]]) -> str:
         inputs = docs["inputs"]
         guide = docs["guide"]
         parts = Path(guide).parts
-        if len(parts) >= 3 and parts[0] == "docs" and parts[1] == "models":
-            slug = parts[2]
-            rel_guide = f"{slug}/{parts[3]}" if len(parts) > 3 else f"{slug}/README.md"
+        if len(parts) == 3 and parts[0] == "docs" and parts[1] == "models":
+            slug = Path(parts[2]).stem
+            rel_guide = parts[2]
         else:
             slug = Path(guide).stem
             rel_guide = guide
@@ -300,6 +302,8 @@ def generate_devlab_registry(root: Path, manifests: List[Dict[str, Any]]) -> str
         "tts-base",
         "tts-custom",
         "tts-design",
+        "image-turbo",
+        "image",
     ]
     ordered_assets = {}
     for k in ASSET_ORDER:
@@ -318,6 +322,11 @@ def generate_devlab_registry(root: Path, manifests: List[Dict[str, Any]]) -> str
         "qwen3-tts-base",
         "qwen3-tts-custom",
         "qwen3-tts-design",
+        "qwen-image-turbo",
+        "qwen-image",
+        "embedding-gemma2-npu",
+        "qwen3-asr-npu",
+        "qwen3-tts-custom-npu",
     ]
     ordered_models = {}
     for k in MODEL_ORDER:
@@ -330,7 +339,7 @@ def generate_devlab_registry(root: Path, manifests: List[Dict[str, Any]]) -> str
     # Combine rules:
     # 1. documentation (from core)
     # 2. outside-current-scope (from core)
-    # 3. model rules (qwen27, flash-next, deepseek, embedding, asr, tts)
+    # 3. model rules (qwen27, flash-next, deepseek, embedding, asr, tts, image)
     # 4. shared rules (shared-audio, service-harness, shared-qwen, shared-text, functional-text, hosted-checks, shared-infrastructure, devlab-orchestration)
     RULE_ORDER = [
         "documentation",
@@ -341,7 +350,9 @@ def generate_devlab_registry(root: Path, manifests: List[Dict[str, Any]]) -> str
         "embedding",
         "asr",
         "tts",
+        "image",
         "shared-audio",
+        "npu",
         "service-harness",
         "shared-qwen",
         "shared-text",
