@@ -48,10 +48,23 @@ inline constexpr std::size_t kContinuationMetadataBytes = 160;
 // owns the arithmetic that fills them.
 using ContinuationBackingClass = cache::BackingClass;
 
+// The state one TP rank holds, which its share of each layer's heads sizes.
+// Empty describes the whole model.
+struct ContinuationRankHeads {
+  struct Layer {
+    std::size_t attention_kv_dim{0};
+    std::size_t conv_channels{0};
+    std::size_t recurrent_floats{0};
+  };
+  std::vector<Layer> layers;
+  std::size_t draft_kv_dim{0};
+};
+
 class ContinuationLayout {
 public:
   ContinuationLayout(const Config&, bool mtp, std::uint32_t context,
-                     std::uint32_t kept_rows);
+                     std::uint32_t kept_rows,
+                     const ContinuationRankHeads& rank = {});
   [[nodiscard]] std::span<const ContinuationComponent> Components() const {
     return components_;
   }

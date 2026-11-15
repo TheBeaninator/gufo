@@ -2,14 +2,24 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <cstring>
+#include <deque>
 #include <exception>
 #include <limits>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 
+#include "src/cache/ledger.hpp"
+#include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/response_format.hpp"
 #include "src/core/json.hpp"
 
@@ -36,12 +46,6 @@ void SetError(std::string* error, std::string message) {
       return "advance";
     case TpInstructionOp::kDecode:
       return "decode";
-    case TpInstructionOp::kSnapshot:
-      return "snapshot";
-    case TpInstructionOp::kDrop:
-      return "drop";
-    case TpInstructionOp::kRestore:
-      return "restore";
     case TpInstructionOp::kReuse:
       return "reuse";
     case TpInstructionOp::kCancelPrepare:
@@ -50,10 +54,14 @@ void SetError(std::string* error, std::string message) {
       return "batched advance";
     case TpInstructionOp::kPromptContext:
       return "prompt context";
-    case TpInstructionOp::kPersist:
-      return "persist";
-    case TpInstructionOp::kRestoreDisk:
-      return "disk restore";
+    case TpInstructionOp::kBeginRestore:
+      return "begin-restore";
+    case TpInstructionOp::kValidate:
+      return "validate";
+    case TpInstructionOp::kReconcile:
+      return "reconcile";
+    case TpInstructionOp::kCopyOut:
+      return "copy-out";
     case TpInstructionOp::kDecodeBatch:
       return "batched decode";
     case TpInstructionOp::kEnd:
@@ -139,24 +147,56 @@ void DigestTpContext(TpExecutionDigest& digest,
   }
 }
 
-// Rank 0's half of a disk-cache payload starts with this header: magic,
-// format, reserved, rank 1's file key, the writing process and the request
-// that produced the snapshot.
-constexpr std::array<std::uint8_t, 8> kPersistMagic = {'G', 'U', 'F', 'O',
-                                                       'T', 'P', '2', 'R'};
-constexpr std::uint32_t kPersistFormat = 1;
-constexpr std::size_t kPersistHeaderBytes = 8 + 4 + 4 + 8 + 8 + 8;
-
-void PutLe(std::uint8_t* out, std::uint64_t value, int bytes) {
-  for (int i = 0; i < bytes; ++i)
-    out[i] = static_cast<std::uint8_t>(value >> (8 * i));
+/// A rank's component descriptors, as rank 1 reports them when the pair forms.
+[[nodiscard]] std::vector<std::byte> EncodeDescriptors(
+    std::span<const cache::ComponentDescriptor> components) {
+  std::vector<std::byte> out;
+  const auto put = [&](std::uint64_t value) {
+    for (unsigned i = 0; i < 8; ++i) {
+      out.push_back(static_cast<std::byte>(value >> (8 * i)));
+    }
+  };
+  put(components.size());
+  for (const auto& d : components) {
+    put(d.id.value);
+    put(d.layout_version);
+    put(static_cast<std::uint64_t>(d.kind));
+    put(d.row_bytes);
+    put(d.rows_per_chunk);
+    put(d.state_bytes);
+    put(d.window_rows);
+  }
+  return out;
 }
 
-std::uint64_t GetLe(const std::uint8_t* in, int bytes) {
-  std::uint64_t value = 0;
-  for (int i = 0; i < bytes; ++i)
-    value |= std::uint64_t{in[i]} << (8 * i);
-  return value;
+[[nodiscard]] std::vector<cache::ComponentDescriptor> DecodeDescriptors(
+    std::span<const std::byte> bytes) {
+  std::size_t offset = 0;
+  const auto get = [&] {
+    if (bytes.size() - offset < 8) {
+      throw std::runtime_error("TP rank 1 sent truncated cache components");
+    }
+    std::uint64_t value = 0;
+    for (unsigned i = 0; i < 8; ++i) {
+      value |= static_cast<std::uint64_t>(bytes[offset++]) << (8 * i);
+    }
+    return value;
+  };
+  const auto count = get();
+  if (count > bytes.size() / 56) {
+    throw std::runtime_error("TP rank 1 sent invalid cache components");
+  }
+  std::vector<cache::ComponentDescriptor> out(count);
+  for (auto& d : out) {
+    d.id.value = static_cast<std::uint32_t>(get());
+    d.layout_version = static_cast<std::uint32_t>(get());
+    d.kind = static_cast<cache::ComponentKind>(get());
+    d.row_bytes = get();
+    d.rows_per_chunk = get();
+    d.state_bytes = get();
+    d.window_rows = get();
+  }
+  return out;
 }
 
 std::uint64_t RandomNonzero() {
@@ -198,7 +238,7 @@ std::shared_ptr<const sampling::TokenConstraint> RebuildConstraint(
   }
   sampling::SamplingConfig config;
   (void)ConstrainChatRequest(
-      request, runner, &config, nullptr,
+      request, runner, &config, nullptr, nullptr,
       source.reasoning ? TextGenerationBackend::InitialOutputState::kReasoning
                        : TextGenerationBackend::InitialOutputState::kContent);
   if (config.constraint == nullptr)
@@ -226,13 +266,9 @@ void DigestTpCall(TpExecutionDigest& digest, const TpInstruction& instruction,
                   std::span<const TextRunnerToken> prefill_prompt) {
   digest.Add(static_cast<std::uint64_t>(instruction.op));
   digest.Add(instruction.state);
-  digest.Add(instruction.snapshot_id);
   digest.Add(static_cast<std::uint32_t>(instruction.token));
   digest.Add(instruction.offset);
-  // A capture carries the request's call count and digest so far, which the
-  // digest cannot include.
-  digest.Add(instruction.op == TpInstructionOp::kSnapshot ? 0
-                                                          : instruction.count);
+  digest.Add(instruction.count);
   digest.Add(instruction.prompt_size);
   digest.Add(instruction.rng);
   digest.Add(static_cast<std::uint32_t>(instruction.pending));
@@ -270,10 +306,9 @@ void DigestTpFailure(TpExecutionDigest& digest) {
 }
 
 bool TpCacheAcknowledged(TpInstructionOp op) noexcept {
-  return op == TpInstructionOp::kSnapshot || op == TpInstructionOp::kRestore ||
-         op == TpInstructionOp::kReuse ||
-         op == TpInstructionOp::kCancelPrepare ||
-         op == TpInstructionOp::kRestoreDisk;
+  return op == TpInstructionOp::kBeginRestore ||
+         op == TpInstructionOp::kValidate || op == TpInstructionOp::kReuse ||
+         op == TpInstructionOp::kCancelPrepare;
 }
 
 void TpControlInstructionSink::Synchronize(std::uint64_t sequence,
@@ -418,21 +453,668 @@ private:
   bool bound_{false};
 };
 
+void TpMirroredRunner::SendCacheOp(const TpInstruction& instruction) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (!failure_.empty()) {
+    throw std::runtime_error("TP instruction channel failed: " + failure_);
+  }
+  std::string error;
+  if (!sink_->Send(0, instruction, nullptr, &error)) {
+    failure_ = error.empty() ? "send failed" : error;
+    throw std::runtime_error("TP instruction send failed: " + failure_);
+  }
+}
+
+void TpMirroredRunner::SyncCacheOp(const TpInstruction& instruction) const {
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (!failure_.empty()) {
+      throw std::runtime_error("TP instruction channel failed: " + failure_);
+    }
+  }
+  sink_->Synchronize(0, instruction, [] {});
+}
+
+void TpMirroredRunner::FailBulk(const std::string& reason) const noexcept {
+  try {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (failure_.empty()) {
+      failure_ = reason;
+    }
+  } catch (...) {
+  }
+}
+
+std::uint64_t TpMirroredRunner::ProducerOf(std::uint32_t state) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  const auto found = producers_.find(state);
+  return found != producers_.end() ? found->second : 0;
+}
+
+bool TpMirroredRunner::AdoptRestored(std::uint32_t state, std::uint64_t nonce,
+                                     std::uint64_t producer) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (nonce != nonce_) {
+    // Written by an earlier process, whose verdicts are gone. It finished, and
+    // its pair restarted cleanly, or it would never have been kept.
+    producers_.erase(state);
+    return true;
+  }
+  if (rejected_.contains(producer)) {
+    return false;
+  }
+  producers_[state] = producer;
+  return true;
+}
+
+void TpMirroredRunner::ForgetProducer(std::uint32_t state) const noexcept {
+  try {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    producers_.erase(state);
+  } catch (...) {
+  }
+}
+
+/// Rank 0's end of the bulk connection. Everything in flight belongs to a
+/// transfer the cache settles before it uses the buffers or the slot again.
+class TpMirroredRunner::Bulk {
+public:
+  Bulk(const TpMirroredRunner* owner, std::shared_ptr<TpBulkSocket> socket)
+      : owner_(owner), socket_(std::move(socket)) {
+    if (socket_ == nullptr) {
+      throw std::invalid_argument("TP mirrored runner needs a bulk connection");
+    }
+  }
+  ~Bulk() {
+    socket_->Shutdown();
+    if (reader_.joinable()) {
+      reader_.join();
+    }
+    FailAll();
+  }
+
+  [[nodiscard]] std::vector<cache::ComponentDescriptor> ReceiveHello() {
+    TpBulkHeader header;
+    std::string error;
+    if (!socket_->ReceiveHeader(&header, &error) ||
+        header.kind != TpBulkKind::kHello || header.bytes > (1U << 24)) {
+      throw std::runtime_error("TP bulk hello failed: " + error);
+    }
+    std::vector<std::byte> bytes(header.bytes);
+    if (!socket_->ReceivePayload(bytes, &error)) {
+      throw std::runtime_error("TP bulk hello failed: " + error);
+    }
+    return DecodeDescriptors(bytes);
+  }
+
+  void Start() {
+    reader_ = std::thread([this] { Read(); });
+  }
+
+  [[nodiscard]] cache::Completion CopyOut(std::uint32_t state,
+                                          std::uint32_t component,
+                                          bool is_private, std::uint64_t first,
+                                          std::uint64_t end,
+                                          std::span<std::byte> destination) {
+    auto transfer = Register(destination);
+    try {
+      owner_->SendCacheOp({.op = TpInstructionOp::kCopyOut,
+                           .state = state,
+                           .transfer = transfer.first,
+                           .component = component,
+                           .is_private = is_private ? 1U : 0U,
+                           .first = first,
+                           .end = end});
+    } catch (...) {
+      Settle(transfer.first, cache::TransferResult::kFailed);
+      throw;
+    }
+    return cache::Completion(std::move(transfer.second));
+  }
+
+  [[nodiscard]] cache::Completion CopyIn(std::uint32_t state,
+                                         std::uint32_t component,
+                                         bool is_private, std::uint64_t first,
+                                         std::uint64_t end,
+                                         std::span<const std::byte> source) {
+    auto transfer = Register({});
+    std::string error;
+    if (!socket_->Send({.kind = TpBulkKind::kIn,
+                        .state = state,
+                        .component = component,
+                        .is_private = is_private ? 1U : 0U,
+                        .transfer = transfer.first,
+                        .first = first,
+                        .end = end,
+                        .bytes = source.size()},
+                       source, &error)) {
+      owner_->FailBulk("TP bulk connection lost: " + error);
+      Settle(transfer.first, cache::TransferResult::kFailed);
+    }
+    return cache::Completion(std::move(transfer.second));
+  }
+
+private:
+  class Signal final : public cache::CompletionSignal {
+  public:
+    [[nodiscard]] bool Ready() const noexcept override {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      return result_.has_value();
+    }
+    [[nodiscard]] cache::TransferResult Wait() noexcept override {
+      std::unique_lock<std::mutex> lock(mutex_);
+      settled_.wait(lock, [&] { return result_.has_value(); });
+      return *result_;
+    }
+    void Settle(cache::TransferResult result) noexcept {
+      {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        result_ = result;
+      }
+      settled_.notify_all();
+    }
+
+  private:
+    mutable std::mutex mutex_;
+    std::condition_variable settled_;
+    std::optional<cache::TransferResult> result_;
+  };
+  struct Pending {
+    std::span<std::byte> destination;
+    Signal* signal;
+    std::shared_ptr<void> keep;
+  };
+  /// The completion owns the signal, and the map keeps it alive until settled.
+  class Shared final : public cache::CompletionSignal {
+  public:
+    explicit Shared(std::shared_ptr<Signal> signal)
+        : signal_(std::move(signal)) {}
+    [[nodiscard]] bool Ready() const noexcept override {
+      return signal_->Ready();
+    }
+    [[nodiscard]] cache::TransferResult Wait() noexcept override {
+      return signal_->Wait();
+    }
+
+  private:
+    std::shared_ptr<Signal> signal_;
+  };
+
+  [[nodiscard]] std::pair<std::uint64_t,
+                          std::unique_ptr<cache::CompletionSignal>>
+  Register(std::span<std::byte> destination) {
+    auto signal = std::make_shared<Signal>();
+    const std::lock_guard<std::mutex> lock(mutex_);
+    const auto transfer = next_transfer_++;
+    if (lost_) {
+      signal->Settle(cache::TransferResult::kFailed);
+    } else {
+      pending_.emplace(transfer, Pending{destination, signal.get(), signal});
+    }
+    return {transfer, std::make_unique<Shared>(std::move(signal))};
+  }
+
+  void Settle(std::uint64_t transfer, cache::TransferResult result) {
+    std::shared_ptr<void> keep;
+    Signal* signal = nullptr;
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      const auto found = pending_.find(transfer);
+      if (found == pending_.end()) {
+        return;
+      }
+      signal = found->second.signal;
+      keep = std::move(found->second.keep);
+      pending_.erase(found);
+    }
+    signal->Settle(result);
+  }
+
+  void FailAll() noexcept {
+    std::unordered_map<std::uint64_t, Pending> pending;
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      lost_ = true;
+      pending.swap(pending_);
+    }
+    for (auto& [transfer, entry] : pending) {
+      entry.signal->Settle(cache::TransferResult::kFailed);
+    }
+  }
+
+  void Read() noexcept {
+    std::string error;
+    for (;;) {
+      TpBulkHeader header;
+      if (!socket_->ReceiveHeader(&header, &error)) {
+        break;
+      }
+      if (header.kind == TpBulkKind::kInDone) {
+        Settle(header.transfer, cache::TransferResult::kSucceeded);
+        continue;
+      }
+      if (header.kind == TpBulkKind::kFailed) {
+        std::vector<std::byte> message(
+            std::min<std::uint64_t>(header.bytes, 4096));
+        if (message.size() != header.bytes ||
+            !socket_->ReceivePayload(message, &error)) {
+          break;
+        }
+        Logger::Warn(
+            "tp", "event=tp_bulk_transfer_failed reason=" +
+                      std::string(reinterpret_cast<const char*>(message.data()),
+                                  message.size()));
+        Settle(header.transfer, cache::TransferResult::kFailed);
+        continue;
+      }
+      if (header.kind != TpBulkKind::kOut) {
+        error = "unexpected frame";
+        break;
+      }
+      std::span<std::byte> destination;
+      {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = pending_.find(header.transfer);
+        if (found != pending_.end()) {
+          destination = found->second.destination;
+        }
+      }
+      if (destination.size() != header.bytes) {
+        error = "a transfer's size does not match its request";
+        break;
+      }
+      if (!socket_->ReceivePayload(destination, &error)) {
+        break;
+      }
+      Settle(header.transfer, cache::TransferResult::kSucceeded);
+    }
+    owner_->FailBulk("TP bulk connection lost: " + error);
+    FailAll();
+  }
+
+  const TpMirroredRunner* owner_;
+  std::shared_ptr<TpBulkSocket> socket_;
+  std::thread reader_;
+  std::mutex mutex_;
+  std::uint64_t next_transfer_{1};
+  bool lost_{false};
+  std::unordered_map<std::uint64_t, Pending> pending_;
+};
+
+/// One execution slot of the pair: rank 0's own, and the id of the slot at the
+/// same index on rank 1.
+class TpMirroredRunner::PairSlot final : public cache::Slot {
+public:
+  PairSlot(std::unique_ptr<cache::Slot> slot, std::uint32_t slot_id,
+           PairAdapter* adapter)
+      : id(slot_id), slot_(std::move(slot)), adapter_(adapter) {}
+  ~PairSlot() override;
+  [[nodiscard]] bool IsValid() const noexcept override {
+    return slot_->IsValid();
+  }
+  [[nodiscard]] bool ExecutionComplete() const noexcept override {
+    return slot_->ExecutionComplete();
+  }
+  [[nodiscard]] cache::Slot& inner() const noexcept { return *slot_; }
+
+  const std::uint32_t id;
+  /// Who produced the rows being restored: the nonce of the writing process
+  /// and its request.
+  std::array<std::uint64_t, 2> restored{};
+
+private:
+  std::unique_ptr<cache::Slot> slot_;
+  PairAdapter* adapter_;
+};
+
+/// Presents both ranks' execution state to rank 0's cache as one model.
+///
+/// The components are rank 0's, then rank 1's under ids from `kPeerBase`, then
+/// `kProducer`: the request that left the rows, so a checkpoint carries its
+/// producer through RAM and disk. Rank 1's are ordinary components whose
+/// transfers cross the bulk connection, so retention, sharing, eviction and
+/// persistence are upstream's, unchanged, and a checkpoint holds both halves
+/// or neither. Rank 1's rows are never borrowed: they stay valid on rank 0
+/// only once copied.
+class TpMirroredRunner::PairAdapter final : public cache::Adapter {
+public:
+  static constexpr std::uint32_t kPeerBase = 1U << 20;
+  static constexpr std::uint32_t kProducer = 1U << 21;
+  [[nodiscard]] static bool IsPair(cache::ComponentId id) noexcept {
+    return id.value >= kPeerBase;
+  }
+
+  PairAdapter(const TpMirroredRunner* owner,
+              std::unique_ptr<cache::Adapter> inner)
+      : owner_(owner), inner_(std::move(inner)) {
+    const auto own = inner_->Components();
+    const auto& peer = owner_->peer_components_;
+    if (peer.size() != own.size()) {
+      throw std::runtime_error("TP ranks hold different cache components");
+    }
+    descriptors_.assign(own.begin(), own.end());
+    identity_ = inner_->CompatibilityIdentity();
+    constexpr std::string_view kMarker = "tp2=pair-v1\n";
+    identity_.insert(identity_.end(), kMarker.begin(), kMarker.end());
+    const auto add = [&](std::uint64_t value) {
+      for (unsigned i = 0; i < 8; ++i) {
+        identity_.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
+      }
+    };
+    for (std::size_t i = 0; i < own.size(); ++i) {
+      if (peer[i].id != own[i].id || peer[i].kind != own[i].kind ||
+          peer[i].rows_per_chunk != own[i].rows_per_chunk ||
+          own[i].id.value == 0 || own[i].id.value >= kPeerBase) {
+        throw std::runtime_error("TP ranks hold different cache components");
+      }
+      auto descriptor = peer[i];
+      descriptor.id.value += kPeerBase;
+      descriptors_.push_back(descriptor);
+      add(descriptor.row_bytes);
+      add(descriptor.state_bytes);
+      const auto bytes = [](const cache::ComponentDescriptor& d) {
+        return cache::HasRows(d.kind) ? d.row_bytes * d.rows_per_chunk
+                                      : d.state_bytes;
+      };
+      if (largest_.value == 0 || bytes(own[i]) >= largest_bytes_) {
+        largest_ = own[i].id;
+        largest_bytes_ = bytes(own[i]);
+      }
+    }
+    descriptors_.push_back({.id = {kProducer},
+                            .layout_version = 1,
+                            .kind = cache::ComponentKind::kPrivateState,
+                            .state_bytes = sizeof(PairSlot::restored)});
+  }
+
+  [[nodiscard]] cache::Adapter& inner() const noexcept { return *inner_; }
+  [[nodiscard]] cache::ComponentId LargestComponent() const noexcept {
+    return largest_;
+  }
+  void Release(std::uint32_t id) noexcept {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    free_slots_.push_back(id);
+  }
+
+  [[nodiscard]] std::vector<cache::BackingClass> BackingPlan(
+      std::size_t bytes) const override {
+    return inner_->BackingPlan(bytes);
+  }
+  [[nodiscard]] cache::Capabilities GetCapabilities() const override {
+    return inner_->GetCapabilities();
+  }
+  [[nodiscard]] std::span<const cache::ComponentDescriptor> Components()
+      const override {
+    return descriptors_;
+  }
+  [[nodiscard]] cache::Identity CompatibilityIdentity() const override {
+    return identity_;
+  }
+  [[nodiscard]] std::unique_ptr<cache::Slot> CreateSlot(
+      cache::MutationGuard& guard) override {
+    auto slot = inner_->CreateSlot(guard);
+    std::uint32_t id = 0;
+    bool reused = false;
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      if (!free_slots_.empty()) {
+        id = free_slots_.back();
+        free_slots_.pop_back();
+        reused = true;
+      } else {
+        id = next_slot_++;
+      }
+    }
+    // The cache replaced a slot it could not reset; rank 1 keeps its own, and
+    // empties it.
+    if (reused) {
+      owner_->SendInvalidate(id);
+      owner_->ForgetProducer(id);
+    }
+    return std::make_unique<PairSlot>(std::move(slot), id, this);
+  }
+  [[nodiscard]] std::vector<cache::ComponentPosition> Positions(
+      const cache::Slot& slot) const override {
+    auto positions = inner_->Positions(As(slot).inner());
+    return WithPeer(std::move(positions));
+  }
+  [[nodiscard]] std::vector<cache::Rows> PlanPrefill(
+      const cache::Slot& slot, cache::Rows first,
+      cache::Rows end) const override {
+    return inner_->PlanPrefill(As(slot).inner(), first, end);
+  }
+  /// A prediction that sizes a capture; the pool asks for one at an aligned
+  /// prefill boundary even without in-pass checkpoints.
+  [[nodiscard]] std::vector<cache::ComponentPosition>
+  PrefillCheckpointPositions(const cache::Slot& slot,
+                             cache::Rows boundary) const override {
+    auto positions =
+        inner_->PrefillCheckpointPositions(As(slot).inner(), boundary);
+    return positions.empty() ? positions : WithPeer(std::move(positions));
+  }
+  void BeginRestore(
+      cache::Slot& slot,
+      std::span<const cache::ComponentPosition> positions) override {
+    auto& pair = As(slot);
+    const auto split = Split(positions);
+    inner_->BeginRestore(pair.inner(), split.own);
+    pair.restored = {};
+    owner_->SyncCacheOp({.op = TpInstructionOp::kBeginRestore,
+                         .state = pair.id,
+                         .positions = split.peer});
+  }
+  [[nodiscard]] bool Validate(
+      cache::Slot& slot,
+      std::span<const cache::ComponentPosition> positions) override {
+    auto& pair = As(slot);
+    const auto split = Split(positions);
+    if (!inner_->Validate(pair.inner(), split.own)) {
+      return false;
+    }
+    try {
+      owner_->SyncCacheOp({.op = TpInstructionOp::kValidate,
+                           .state = pair.id,
+                           .positions = split.peer});
+    } catch (const std::exception& exception) {
+      Logger::Warn("tp", std::string("event=tp_restore_refused reason=") +
+                             exception.what());
+      return false;
+    }
+    return owner_->AdoptRestored(pair.id, pair.restored[0], pair.restored[1]);
+  }
+  [[nodiscard]] bool Invalidate(cache::Slot& slot) noexcept override {
+    auto& pair = As(slot);
+    if (!inner_->Invalidate(pair.inner())) {
+      return false;
+    }
+    owner_->SendInvalidate(pair.id);
+    owner_->ForgetProducer(pair.id);
+    return true;
+  }
+  [[nodiscard]] cache::Completion CapturePrivate(
+      const cache::Slot& slot, cache::ComponentId id,
+      std::span<std::byte> bytes, cache::Stream& stream) override {
+    return CapturePrivatePiece(slot, id, 0, bytes, stream);
+  }
+  [[nodiscard]] cache::Completion CapturePrivatePiece(
+      const cache::Slot& slot, cache::ComponentId id, std::size_t offset,
+      std::span<std::byte> bytes, cache::Stream& stream) override {
+    const auto& pair = As(slot);
+    if (id.value == kProducer) {
+      const std::array<std::uint64_t, 2> producer{owner_->nonce_,
+                                                  owner_->ProducerOf(pair.id)};
+      if (offset + bytes.size() > sizeof(producer)) {
+        throw std::invalid_argument("TP producer capture is out of range");
+      }
+      std::memcpy(bytes.data(),
+                  reinterpret_cast<const std::byte*>(producer.data()) + offset,
+                  bytes.size());
+      return Ready();
+    }
+    if (id.value >= kPeerBase) {
+      return owner_->bulk_->CopyOut(pair.id, id.value - kPeerBase, true, offset,
+                                    offset + bytes.size(), bytes);
+    }
+    return offset == 0 && bytes.size() == Private(id)
+               ? inner_->CapturePrivate(pair.inner(), id, bytes, stream)
+               : inner_->CapturePrivatePiece(pair.inner(), id, offset, bytes,
+                                             stream);
+  }
+  [[nodiscard]] cache::Completion LoadPrivate(cache::Slot& slot,
+                                              cache::ComponentId id,
+                                              std::span<const std::byte> bytes,
+                                              cache::Stream& stream) override {
+    return LoadPrivatePiece(slot, id, 0, bytes, stream);
+  }
+  [[nodiscard]] cache::Completion LoadPrivatePiece(
+      cache::Slot& slot, cache::ComponentId id, std::size_t offset,
+      std::span<const std::byte> bytes, cache::Stream& stream) override {
+    auto& pair = As(slot);
+    if (id.value == kProducer) {
+      if (offset + bytes.size() > sizeof(pair.restored)) {
+        throw std::invalid_argument("TP producer restore is out of range");
+      }
+      std::memcpy(reinterpret_cast<std::byte*>(pair.restored.data()) + offset,
+                  bytes.data(), bytes.size());
+      return Ready();
+    }
+    if (id.value >= kPeerBase) {
+      return owner_->bulk_->CopyIn(pair.id, id.value - kPeerBase, true, offset,
+                                   offset + bytes.size(), bytes);
+    }
+    return offset == 0 && bytes.size() == Private(id)
+               ? inner_->LoadPrivate(pair.inner(), id, bytes, stream)
+               : inner_->LoadPrivatePiece(pair.inner(), id, offset, bytes,
+                                          stream);
+  }
+  [[nodiscard]] cache::Completion CopyRowsOut(const cache::Slot& slot,
+                                              cache::ComponentId id,
+                                              cache::Rows first,
+                                              cache::Rows end,
+                                              std::span<std::byte> bytes,
+                                              cache::Stream& stream) override {
+    const auto& pair = As(slot);
+    if (id.value >= kPeerBase) {
+      return owner_->bulk_->CopyOut(pair.id, id.value - kPeerBase, false, first,
+                                    end, bytes);
+    }
+    return inner_->CopyRowsOut(pair.inner(), id, first, end, bytes, stream);
+  }
+  [[nodiscard]] std::span<const std::byte> BorrowRowsView(
+      const cache::Slot& slot, cache::ComponentId id, cache::Rows first,
+      cache::Rows end) const override {
+    return id.value >= kPeerBase
+               ? std::span<const std::byte>{}
+               : inner_->BorrowRowsView(As(slot).inner(), id, first, end);
+  }
+  [[nodiscard]] cache::Completion CopyRowsIn(cache::Slot& slot,
+                                             cache::ComponentId id,
+                                             cache::Rows first, cache::Rows end,
+                                             std::span<const std::byte> bytes,
+                                             cache::Stream& stream) override {
+    auto& pair = As(slot);
+    if (id.value >= kPeerBase) {
+      return owner_->bulk_->CopyIn(pair.id, id.value - kPeerBase, false, first,
+                                   end, bytes);
+    }
+    return inner_->CopyRowsIn(pair.inner(), id, first, end, bytes, stream);
+  }
+
+private:
+  struct Positions_ {
+    std::vector<cache::ComponentPosition> own;
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> peer;
+  };
+  class ReadySignal final : public cache::CompletionSignal {
+  public:
+    [[nodiscard]] bool Ready() const noexcept override { return true; }
+    [[nodiscard]] cache::TransferResult Wait() noexcept override {
+      return cache::TransferResult::kSucceeded;
+    }
+  };
+  [[nodiscard]] static cache::Completion Ready() {
+    return cache::Completion(std::make_unique<ReadySignal>());
+  }
+  [[nodiscard]] static PairSlot& As(cache::Slot& slot) {
+    return dynamic_cast<PairSlot&>(slot);
+  }
+  [[nodiscard]] static const PairSlot& As(const cache::Slot& slot) {
+    return dynamic_cast<const PairSlot&>(slot);
+  }
+  [[nodiscard]] std::size_t Private(cache::ComponentId id) const {
+    for (const auto& descriptor : descriptors_) {
+      if (descriptor.id == id) {
+        return descriptor.state_bytes;
+      }
+    }
+    throw std::invalid_argument("unknown TP cache component");
+  }
+  [[nodiscard]] std::vector<cache::ComponentPosition> WithPeer(
+      std::vector<cache::ComponentPosition> own) const {
+    const auto count = own.size();
+    own.reserve(2 * count + 1);
+    // Rows count themselves, and both ranks made the same calls, so a peer
+    // component stands exactly where rank 0's does.
+    cache::Rows boundary = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+      const auto position = own[i];
+      own.push_back({{position.id.value + kPeerBase}, position.valid_rows});
+      boundary = std::max(boundary, position.valid_rows);
+    }
+    own.push_back({{kProducer}, boundary});
+    return own;
+  }
+  [[nodiscard]] static Positions_ Split(
+      std::span<const cache::ComponentPosition> positions) {
+    Positions_ split;
+    for (const auto& position : positions) {
+      if (position.id.value == kProducer) {
+        continue;
+      }
+      if (position.id.value >= kPeerBase) {
+        split.peer.emplace_back(position.id.value - kPeerBase,
+                                position.valid_rows);
+      } else {
+        split.own.push_back(position);
+      }
+    }
+    return split;
+  }
+
+  const TpMirroredRunner* owner_;
+  std::unique_ptr<cache::Adapter> inner_;
+  std::vector<cache::ComponentDescriptor> descriptors_;
+  cache::Identity identity_;
+  cache::ComponentId largest_{};
+  std::size_t largest_bytes_{0};
+  std::mutex mutex_;
+  std::uint32_t next_slot_{0};
+  std::vector<std::uint32_t> free_slots_;
+};
+
+TpMirroredRunner::PairSlot::~PairSlot() {
+  adapter_->Release(id);
+}
+
 TpMirroredRunner::TpMirroredRunner(std::shared_ptr<TextModelRunner> inner,
                                    std::shared_ptr<TpInstructionSink> sink,
-                                   std::size_t snapshot_budget,
+                                   std::shared_ptr<TpBulkSocket> bulk,
                                    std::shared_ptr<TpCallScope> scope)
     : inner_(std::move(inner)),
       sink_(std::move(sink)),
-      snapshot_budget_(snapshot_budget),
-      scope_(std::move(scope)) {
+      scope_(std::move(scope)),
+      bulk_(std::make_unique<Bulk>(this, std::move(bulk))) {
   if (inner_ == nullptr || sink_ == nullptr) {
     throw std::invalid_argument("TP mirrored runner needs a runner and a sink");
   }
   const auto capabilities = inner_->Descriptor().capabilities;
   multi_token_decode_ = capabilities.multi_token_decode;
   nonce_ = RandomNonzero();
+  peer_components_ = bulk_->ReceiveHello();
+  bulk_->Start();
 }
+
+TpMirroredRunner::~TpMirroredRunner() = default;
 
 void TpMirroredRunner::BeginRequest(std::uint64_t sequence,
                                     bool constraint_mirrored) {
@@ -503,29 +1185,45 @@ void TpMirroredRunner::Settle(std::uint64_t sequence, bool agreed) {
 }
 
 bool TpMirroredRunner::AwaitDependencies(std::uint64_t sequence) const {
-  // A dependency has released its state, so its verdict follows within one
-  // round trip once rank 1 reaches its end.
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  // A verdict follows within one round trip once rank 1 reaches a producer's
+  // end, so only a producer that has ended can be overdue. One still open may
+  // legitimately run for much longer than this request.
+  const auto grace = dependency_grace_;
   std::unique_lock<std::mutex> lock(mutex_);
+  std::optional<std::chrono::steady_clock::time_point> deadline;
   for (;;) {
     const auto found = dependencies_.find(sequence);
     if (found == dependencies_.end()) {
       return true;
     }
     bool pending = false;
+    bool open = false;
     for (const auto producer : found->second) {
       if (rejected_.contains(producer)) {
         return false;
       }
       pending = pending || unsettled_.contains(producer);
+      open = open || requests_.contains(producer);
     }
     if (!pending) {
       return true;
     }
-    if (settled_.wait_until(lock, deadline) == std::cv_status::timeout) {
+    // A failed channel settles nothing more.
+    if (!failure_.empty()) {
       return false;
     }
+    if (open) {
+      deadline.reset();
+      settled_.wait_for(lock, grace);
+      continue;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (!deadline.has_value()) {
+      deadline = now + grace;
+    } else if (now >= *deadline) {
+      return false;
+    }
+    settled_.wait_until(lock, *deadline);
   }
 }
 
@@ -534,7 +1232,15 @@ std::string TpMirroredRunner::Failure() const {
   return failure_;
 }
 
-bool TpMirroredRunner::CanReuse(const TextRunnerState& state) const {
+bool TpMirroredRunner::HasDecodeFrontier(const TextRunnerState& state) const {
+  return inner_->HasDecodeFrontier(Mirrored(state).inner());
+}
+
+bool TpMirroredRunner::CanContinue(const TextRunnerState& state,
+                                   std::size_t prompt_tokens) const {
+  if (!inner_->CanContinue(Mirrored(state).inner(), prompt_tokens)) {
+    return false;
+  }
   // A released state is reused before its producer's verdict arrives, as on
   // one host; the reusing request then depends on that verdict.
   const auto id = Mirrored(state).id();
@@ -661,32 +1367,16 @@ void TpMirroredRunner::Record(
 TextRunnerDescriptor TpMirroredRunner::Descriptor() const {
   auto descriptor = inner_->Descriptor();
   // An in-pass checkpoint would capture inside a call rank 1 cannot mirror
-  // yet; the scheduler then splits the pass at the boundary and snapshots.
+  // yet; the pool then splits the pass at the boundary and captures there.
   descriptor.capabilities.in_pass_checkpoint = false;
   // Rolling back an interrupted prefill needs the call to stop mid-pass,
   // where rank 1 would be left inside an exchange; calls here always finish.
   descriptor.capabilities.prefill_rollback = false;
-  if (descriptor.persistence.has_value()) {
-    // Rank 0's files hold its half and name rank 1's: neither a one-host
-    // server nor a lone rank can restore them.
-    constexpr std::string_view kMarker = "tp2=rank0-mirror-v1\n";
-    auto& identity = descriptor.persistence->compatibility_identity;
-    identity.insert(identity.end(), kMarker.begin(), kMarker.end());
-  }
   return descriptor;
 }
 
 TextRunnerResourceClaim TpMirroredRunner::ResourceClaim() const {
-  auto claim = inner_->ResourceClaim();
-  // Rank 1 holds the other half of every snapshot within the budget both
-  // ranks agreed on, so neither limit may go beyond it.
-  const auto automatic = claim.retained_snapshot_capacity_bytes.value_or(0);
-  claim.retained_snapshot_capacity_bytes =
-      std::min(automatic, snapshot_budget_);
-  claim.retained_snapshot_ceiling_bytes =
-      std::min(claim.retained_snapshot_ceiling_bytes.value_or(automatic),
-               snapshot_budget_);
-  return claim;
+  return inner_->ResourceClaim();
 }
 
 std::vector<TextExecutionPlan> TpMirroredRunner::SupportedPlans() const {
@@ -821,13 +1511,57 @@ std::string TpMirroredRunner::Decode(
   return inner_->Decode(tokens);
 }
 
-std::unique_ptr<TextRunnerState> TpMirroredRunner::CreateState() const {
-  auto inner = inner_->CreateState();
-  if (inner == nullptr) {
-    return nullptr;
+std::unique_ptr<ComponentCacheResources>
+TpMirroredRunner::CreateComponentCacheResources(cache::ResourceLedger& ledger,
+                                                std::size_t ram) const {
+  auto resources = inner_->CreateComponentCacheResources(ledger, ram);
+  if (resources == nullptr || resources->adapter == nullptr) {
+    throw std::runtime_error("TP2 needs a runner with a component cache");
   }
-  const std::lock_guard<std::mutex> lock(mutex_);
-  return std::make_unique<State>(this, std::move(inner), next_state_id_++);
+  auto pair =
+      std::make_unique<PairAdapter>(this, std::move(resources->adapter));
+  const auto largest_component = pair->LargestComponent();
+  // The provider sizes its allocations by the components it was built with.
+  // Rank 1's take whole shared backing pages too, so they ask under the
+  // provider's largest class; the request's bytes still bound the allocation.
+  auto allocate = std::move(resources->allocate);
+  resources->allocate = [allocate = std::move(allocate),
+                         largest =
+                             largest_component](cache::PayloadRequest request) {
+    if (PairAdapter::IsPair(request.component)) {
+      request.component = largest;
+    }
+    return allocate(request);
+  };
+  resources->adapter = std::move(pair);
+  return resources;
+}
+
+std::unique_ptr<TextRunnerState> TpMirroredRunner::BindComponentState(
+    cache::Adapter& adapter, cache::Slot& slot) const {
+  auto& pair = dynamic_cast<PairAdapter&>(adapter);
+  auto& bound = dynamic_cast<PairSlot&>(slot);
+  return std::make_unique<State>(
+      this, inner_->BindComponentState(pair.inner(), bound.inner()), bound.id);
+}
+
+void TpMirroredRunner::ReconcileComponentState(TextRunnerState& state,
+                                               std::size_t position) const {
+  auto& mirrored = Mirrored(state);
+  SendCacheOp({.op = TpInstructionOp::kReconcile,
+               .state = mirrored.id(),
+               .first = position});
+  inner_->ReconcileComponentState(mirrored.inner(), position);
+}
+
+bool TpMirroredRunner::BeginTpOperation(std::uint64_t index,
+                                        std::string* error) const {
+  return inner_->BeginTpOperation(index, error);
+}
+
+bool TpMirroredRunner::EndTpOperation(std::uint64_t index,
+                                      std::string* error) const {
+  return inner_->EndTpOperation(index, error);
 }
 
 std::optional<TextDecodeSelection> TpMirroredRunner::PreviewFirstToken(
@@ -876,6 +1610,7 @@ TextPrefillStep TpMirroredRunner::Prefill(
   // The pool's lookahead continues the request prompt past this frontier, as
   // rank 1's copy of it does, so its length is all rank 1 needs.
   const auto lookahead = state.prefill_lookahead();
+  mirrored.inner().SetPrefillPromptEnd(state.prefill_prompt_end());
   const TpInstruction instruction{
       .op = TpInstructionOp::kPrefill,
       .state = mirrored.id(),
@@ -911,7 +1646,6 @@ TextDecodeSelection TpMirroredRunner::SelectNext(
 
 void TpMirroredRunner::Advance(TextRunnerState& state,
                                TextRunnerToken token) const {
-  const TpSnapshotGate::Turn turn(snapshot_gate_);
   const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
   auto& mirrored = Mirrored(state);
   const auto sent = Send(mirrored.id(), {.op = TpInstructionOp::kAdvance,
@@ -933,7 +1667,6 @@ void TpMirroredRunner::Advance(TextRunnerState& state,
 TextDecodeStep TpMirroredRunner::DecodeStep(
     TextRunnerState& state, std::size_t max_tokens,
     sampling::SamplerState& sampler) const {
-  const TpSnapshotGate::Turn turn(snapshot_gate_);
   const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
   // A multi-token cycle is one instruction. It carries the sampler's draw
   // state, so rank 1, whose sampler otherwise matches, draws what rank 0 draws
@@ -982,7 +1715,6 @@ TextDecodeStep TpMirroredRunner::DecodeStep(
 
 std::vector<TextDecodeStep> TpMirroredRunner::DecodeBatch(
     std::span<const TextRunnerDecode> decodes) const {
-  const TpSnapshotGate::Turn turn(snapshot_gate_);
   if (decodes.size() < 2 || !multi_token_decode_ ||
       std::ranges::any_of(decodes, [this](const TextRunnerDecode& decode) {
         return !CyclesMirrored(decode.state.get(), decode.sampler.get());
@@ -1061,7 +1793,6 @@ std::vector<TextDecodeStep> TpMirroredRunner::DecodeBatch(
 
 void TpMirroredRunner::AdvanceBatch(
     std::span<const TextRunnerAdvance> advances) const {
-  const TpSnapshotGate::Turn turn(snapshot_gate_);
   if (advances.size() < 2) {
     TextModelRunner::AdvanceBatch(advances);
     return;
@@ -1129,38 +1860,10 @@ void TpMirroredRunner::PrepareCancellation(TextRunnerState& state) const {
       [&] { inner_->PrepareCancellation(mirrored.inner()); });
 }
 
-class TpMirroredRunner::SnapshotHandle final : public TextRunnerSnapshot {
-public:
-  SnapshotHandle(std::shared_ptr<const TpMirroredRunner> owner,
-                 std::unique_ptr<TextRunnerSnapshot> inner, std::uint64_t id,
-                 std::uint64_t producer)
-      : owner(std::move(owner)),
-        inner(std::move(inner)),
-        id(id),
-        producer(producer) {}
-  ~SnapshotHandle() override { owner->Drop(id); }
-  std::size_t PayloadBytes() const noexcept override {
-    return inner->PayloadBytes();
-  }
-  /// Rank 0's hint stands for both ranks: a state reached the same way holds
-  /// the same rows on rank 1.
-  [[nodiscard]] bool PrefersState(
-      const ContinuationState& state) const noexcept override {
-    const auto* mirrored = dynamic_cast<const State*>(&state);
-    return mirrored != nullptr && inner->PrefersState(mirrored->inner());
-  }
-  std::shared_ptr<const TpMirroredRunner> owner;
-  std::unique_ptr<TextRunnerSnapshot> inner;
-  std::uint64_t id;
-  /// The last request that changed the captured state, zero for none.
-  std::uint64_t producer;
-};
-
 std::uint64_t TpMirroredRunner::CacheCall(
     std::uint32_t state, const TpInstruction& instruction,
     const std::function<void()>& local) const {
   std::uint64_t sequence = 0;
-  TpInstruction sent;
   {
     const std::lock_guard<std::mutex> lock(mutex_);
     const auto lease = leases_.find(state);
@@ -1171,249 +1874,15 @@ std::uint64_t TpMirroredRunner::CacheCall(
     auto& request = requests_.at(sequence);
     DigestTpCall(request.digest, instruction);
     ++request.count;
-    if (instruction.op != TpInstructionOp::kSnapshot) {
-      producers_[state] = sequence;
-    }
-    sent = instruction;
-    if (instruction.op == TpInstructionOp::kSnapshot) {
-      // Rank 1 compares the request's calls so far before it captures, so a
-      // snapshot is known to hold the same state on both ranks.
-      sent.count = ToWire(request.count, "count");
-      sent.digest = request.digest.value();
-    }
+    producers_[state] = sequence;
   }
   try {
-    sink_->Synchronize(sequence, sent, local);
+    sink_->Synchronize(sequence, instruction, local);
   } catch (...) {
-    // A failed capture is a skipped snapshot on both ranks, and a failed disk
-    // restore a cache miss (the cache resets the state), not a failed call.
-    if (instruction.op != TpInstructionOp::kSnapshot &&
-        instruction.op != TpInstructionOp::kRestoreDisk) {
-      Record(sequence, DigestTpFailure);
-    }
+    Record(sequence, DigestTpFailure);
     throw;
   }
   return sequence;
-}
-
-void TpMirroredRunner::Drop(std::uint64_t id) const noexcept {
-  try {
-    const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
-    const std::lock_guard<std::mutex> lock(mutex_);
-    if (!failure_.empty())
-      return;
-    // A drop only frees memory, so it belongs to no request.
-    const TpInstruction instruction{.op = TpInstructionOp::kDrop,
-                                    .snapshot_id = id};
-    std::string error;
-    if (!sink_->Send(0, instruction, nullptr, &error))
-      failure_ = "snapshot drop failed: " + error;
-  } catch (...) {
-    // Match reset's deferred channel failure behavior; destructors must not
-    // throw.
-    try {
-      const std::lock_guard<std::mutex> lock(mutex_);
-      failure_ = "snapshot drop failed";
-    } catch (...) {
-    }
-  }
-}
-
-std::size_t TpMirroredRunner::SnapshotPayloadBytes(
-    const TextRunnerState& state) const {
-  return inner_->SnapshotPayloadBytes(Mirrored(state).inner());
-}
-
-std::unique_ptr<TextRunnerSnapshot> TpMirroredRunner::Snapshot(
-    const TextRunnerState& state) const {
-  return Capture(state, false);
-}
-
-std::unique_ptr<TextRunnerSnapshot> TpMirroredRunner::SnapshotForPersistence(
-    const TextRunnerState& state) const {
-  return Capture(state, true);
-}
-
-std::unique_ptr<TextRunnerSnapshot> TpMirroredRunner::Capture(
-    const TextRunnerState& state, bool complete) const {
-  TpSnapshotGate::Pending pending(snapshot_gate_);
-  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
-  pending.Acquired();
-  const auto& mirrored = Mirrored(state);
-  if (next_snapshot_id_ == std::numeric_limits<std::uint64_t>::max()) {
-    throw std::overflow_error("TP snapshot ID exhausted");
-  }
-  const auto id = next_snapshot_id_++;
-  std::uint64_t producer = 0;
-  {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    if (const auto found = producers_.find(mirrored.id());
-        found != producers_.end()) {
-      producer = found->second;
-    }
-  }
-  std::unique_ptr<TextRunnerSnapshot> snapshot;
-  try {
-    (void)CacheCall(
-        mirrored.id(),
-        {.op = TpInstructionOp::kSnapshot,
-         .state = mirrored.id(),
-         .offset = complete ? 1U : 0U,
-         .snapshot_id = id},
-        [&] {
-          snapshot = complete ? inner_->SnapshotForPersistence(mirrored.inner())
-                              : inner_->Snapshot(mirrored.inner());
-          if (!snapshot)
-            throw std::runtime_error("snapshot capture returned null");
-        });
-    return std::make_unique<SnapshotHandle>(shared_from_this(),
-                                            std::move(snapshot), id, producer);
-  } catch (...) {
-    Drop(id);
-    throw;
-  }
-}
-
-void TpMirroredRunner::RestoreOrFork(TextRunnerState& state,
-                                     const TextRunnerSnapshot& snapshot) const {
-  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
-  const auto* handle = dynamic_cast<const SnapshotHandle*>(&snapshot);
-  if (!handle || handle->owner.get() != this)
-    throw std::invalid_argument("foreign TP snapshot");
-  auto& mirrored = Mirrored(state);
-  {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    const auto lease = leases_.find(mirrored.id());
-    if (lease != leases_.end() && handle->producer != 0 &&
-        handle->producer != lease->second &&
-        unsettled_.contains(handle->producer)) {
-      dependencies_[lease->second].insert(handle->producer);
-    }
-  }
-  const auto sequence = CacheCall(
-      mirrored.id(),
-      {.op = TpInstructionOp::kRestore,
-       .state = mirrored.id(),
-       .snapshot_id = handle->id},
-      [&] { inner_->RestoreOrFork(mirrored.inner(), *handle->inner); });
-  Record(sequence, [&](TpExecutionDigest& digest) {
-    digest.Add(inner_->CheckpointPosition(mirrored.inner()));
-  });
-}
-
-bool TpMirroredRunner::CanReuse(const TextRunnerSnapshot& snapshot) const {
-  // Rank 1 compared both ranks' calls before capturing, so a snapshot is
-  // reusable as soon as it exists, until its producer is rejected; a request
-  // that restores it earlier depends on that verdict.
-  const auto* handle = dynamic_cast<const SnapshotHandle*>(&snapshot);
-  if (handle == nullptr || handle->owner.get() != this) {
-    return false;
-  }
-  const std::lock_guard<std::mutex> lock(mutex_);
-  return !rejected_.contains(handle->producer);
-}
-
-std::size_t TpMirroredRunner::PersistentSnapshotPayloadBytes(
-    const TextRunnerSnapshot& snapshot) const {
-  const auto* handle = dynamic_cast<const SnapshotHandle*>(&snapshot);
-  if (handle == nullptr || handle->owner.get() != this)
-    throw std::invalid_argument("foreign TP snapshot");
-  return kPersistHeaderBytes +
-         inner_->PersistentSnapshotPayloadBytes(*handle->inner);
-}
-
-std::vector<std::uint8_t> TpMirroredRunner::BeginPersist(
-    const TextRunnerSnapshot& snapshot) const {
-  const auto* handle = dynamic_cast<const SnapshotHandle*>(&snapshot);
-  if (handle == nullptr || handle->owner.get() != this)
-    throw std::invalid_argument("foreign TP snapshot");
-  const auto key = RandomNonzero();
-  {
-    const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
-    const std::lock_guard<std::mutex> lock(mutex_);
-    if (!failure_.empty())
-      throw std::runtime_error("TP instruction channel failed: " + failure_);
-    // What rank 1 rejected never reaches the disk. A snapshot of a request
-    // still running is written, and checked again if restored in this
-    // process.
-    if (rejected_.contains(handle->producer))
-      throw std::runtime_error("TP snapshot of a rejected request");
-    // Rank 1 persists its half in the background: the snapshot outlives the
-    // write there, and a failed write only makes a later restore a miss.
-    const TpInstruction instruction{.op = TpInstructionOp::kPersist,
-                                    .snapshot_id = handle->id,
-                                    .file_key = key};
-    std::string error;
-    if (!sink_->Send(0, instruction, nullptr, &error)) {
-      failure_ = "snapshot persist send failed: " + error;
-      throw std::runtime_error(failure_);
-    }
-  }
-  std::vector<std::uint8_t> header(kPersistHeaderBytes);
-  std::copy(kPersistMagic.begin(), kPersistMagic.end(), header.begin());
-  PutLe(header.data() + 8, kPersistFormat, 4);
-  PutLe(header.data() + 16, key, 8);
-  PutLe(header.data() + 24, nonce_, 8);
-  PutLe(header.data() + 32, handle->producer, 8);
-  return header;
-}
-
-std::size_t TpMirroredRunner::SerializePersistentSnapshot(
-    const TextRunnerSnapshot& snapshot,
-    std::span<std::uint8_t> destination) const {
-  const auto bytes = PersistentSnapshotPayloadBytes(snapshot);
-  if (destination.size() < bytes)
-    throw std::invalid_argument("TP persistent snapshot destination too small");
-  const auto header = BeginPersist(snapshot);
-  std::copy(header.begin(), header.end(), destination.begin());
-  const auto& handle = dynamic_cast<const SnapshotHandle&>(snapshot);
-  return header.size() + inner_->SerializePersistentSnapshot(
-                             *handle.inner, destination.subspan(header.size()));
-}
-
-void TpMirroredRunner::StreamPersistentSnapshot(
-    const TextRunnerSnapshot& snapshot, const SnapshotSink& sink) const {
-  const auto header = BeginPersist(snapshot);
-  sink(header);
-  const auto& handle = dynamic_cast<const SnapshotHandle&>(snapshot);
-  inner_->StreamPersistentSnapshot(*handle.inner, sink);
-}
-
-void TpMirroredRunner::RestorePersistentSnapshot(
-    TextRunnerState& state, std::span<const std::uint8_t> payload) const {
-  if (payload.size() < kPersistHeaderBytes ||
-      !std::equal(kPersistMagic.begin(), kPersistMagic.end(),
-                  payload.begin()) ||
-      GetLe(payload.data() + 8, 4) != kPersistFormat)
-    throw std::invalid_argument("not a TP2 disk-cache payload");
-  const auto key = GetLe(payload.data() + 16, 8);
-  const auto nonce = GetLe(payload.data() + 24, 8);
-  const auto producer = GetLe(payload.data() + 32, 8);
-  if (key == 0)
-    throw std::invalid_argument("TP2 disk-cache payload names no file");
-  const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
-  auto& mirrored = Mirrored(state);
-  if (nonce == nonce_) {
-    // Written by this process: as for a snapshot in memory, a rejected
-    // producer makes the file a miss, and one without a verdict yet makes
-    // the restoring request depend on it.
-    const std::lock_guard<std::mutex> lock(mutex_);
-    if (rejected_.contains(producer))
-      throw std::runtime_error("TP snapshot of a request rank 1 rejected");
-    const auto lease = leases_.find(mirrored.id());
-    if (lease != leases_.end() && producer != 0 && producer != lease->second &&
-        unsettled_.contains(producer)) {
-      dependencies_[lease->second].insert(producer);
-    }
-  }
-  (void)CacheCall(mirrored.id(),
-                  {.op = TpInstructionOp::kRestoreDisk,
-                   .state = mirrored.id(),
-                   .file_key = key},
-                  [&] {
-                    inner_->RestorePersistentSnapshot(
-                        mirrored.inner(), payload.subspan(kPersistHeaderBytes));
-                  });
 }
 
 /// One open request on rank 1: what it needs to execute rank 0's calls for it
@@ -1455,25 +1924,248 @@ struct TpExecutor::Request {
   std::string failure;
 };
 
-TpExecutor::TpExecutor(std::shared_ptr<TextModelRunner> runner,
-                       std::size_t state_count, std::size_t snapshot_budget,
-                       std::shared_ptr<TpCallScope> scope,
-                       std::shared_ptr<TpDiskStore> disk)
-    : runner_(std::move(runner)),
-      scope_(std::move(scope)),
-      disk_(std::move(disk)),
-      snapshot_budget_(snapshot_budget) {
-  if (runner_ == nullptr || state_count == 0) {
-    throw std::invalid_argument("TP executor needs a runner and a state");
+namespace {
+/// Rank 1 keeps no checkpoints: nothing borrows its slots' rows, so nothing
+/// needs preserving before they change.
+class NoBorrowers final : public cache::MutationGuard {
+public:
+  void BeforeOverwrite(cache::ComponentId, cache::Rows, cache::Rows) override {}
+  void BeforeRelease(cache::ComponentId, cache::Rows,
+                     cache::Rows) noexcept override {}
+};
+}  // namespace
+
+/// Rank 1's end of the bulk connection: one thread sends what the control
+/// channel asked for, in order, and another applies what rank 0 restores.
+/// Rank 0 settles a slot's transfers before it runs that slot again, so both
+/// run beside model calls on other slots.
+class TpExecutor::Bulk {
+public:
+  Bulk(TpExecutor* owner, std::shared_ptr<TpBulkSocket> socket)
+      : owner_(owner), socket_(std::move(socket)) {}
+  ~Bulk() {
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+    }
+    wake_.notify_all();
+    socket_->Shutdown();
+    if (out_.joinable()) {
+      out_.join();
+    }
+    if (in_.joinable()) {
+      in_.join();
+    }
   }
+  void SendHello(std::span<const cache::ComponentDescriptor> components) {
+    const auto bytes = EncodeDescriptors(components);
+    std::string error;
+    if (!socket_->Send({.kind = TpBulkKind::kHello, .bytes = bytes.size()},
+                       bytes, &error)) {
+      throw std::runtime_error("TP bulk hello failed: " + error);
+    }
+  }
+  void Start() {
+    out_ = std::thread([this] { SendLoop(); });
+    in_ = std::thread([this] { ReceiveLoop(); });
+  }
+  void EnqueueOut(const TpInstruction& instruction) {
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      jobs_.push_back(instruction);
+    }
+    wake_.notify_all();
+  }
+
+private:
+  class Buffer {
+  public:
+    explicit Buffer(TpExecutor* owner) : owner_(owner) {}
+    [[nodiscard]] std::span<std::byte> Get(std::size_t bytes) {
+      if (bytes > size_) {
+        const auto size = std::max<std::size_t>(std::bit_ceil(bytes), 1U << 20);
+        auto allocation = owner_->resources_->staging(size);
+        owner_allocation_ = std::move(allocation.owner);
+        data_ = reinterpret_cast<std::byte*>(allocation.bytes.data());
+        size_ = size;
+      }
+      return {data_, bytes};
+    }
+
+  private:
+    TpExecutor* owner_;
+    std::shared_ptr<void> owner_allocation_;
+    std::byte* data_{nullptr};
+    std::size_t size_{0};
+  };
+
+  [[nodiscard]] std::unique_ptr<cache::Stream> Stream() const {
+    for (;;) {
+      if (auto stream = owner_->resources_->stream()) {
+        return stream;
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+  }
+  void Settle(cache::Completion& completion) const {
+    if (completion.Wait() != cache::TransferResult::kSucceeded) {
+      throw std::runtime_error("device transfer failed");
+    }
+  }
+  [[nodiscard]] bool Fail(std::uint64_t transfer, const std::string& reason) {
+    const std::string message = reason.substr(0, 4096);
+    std::string error;
+    return socket_->Send(
+        {.kind = TpBulkKind::kFailed,
+         .transfer = transfer,
+         .bytes = message.size()},
+        std::as_bytes(std::span<const char>(message.data(), message.size())),
+        &error);
+  }
+  void SendLoop() noexcept {
+    Buffer buffer(owner_);
+    for (;;) {
+      TpInstruction job;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        wake_.wait(lock, [&] { return stopping_ || !jobs_.empty(); });
+        if (stopping_) {
+          return;
+        }
+        job = std::move(jobs_.front());
+        jobs_.pop_front();
+      }
+      try {
+        auto& slot = *owner_->slots_.at(job.state);
+        const cache::ComponentId id{job.component};
+        const std::size_t bytes =
+            job.is_private != 0 ? job.end - job.first
+                                : (job.end - job.first) * owner_->RowBytes(id);
+        const auto destination = buffer.Get(bytes);
+        const auto stream = Stream();
+        auto completion =
+            job.is_private != 0
+                ? owner_->adapter_->CapturePrivatePiece(slot, id, job.first,
+                                                        destination, *stream)
+                : owner_->adapter_->CopyRowsOut(slot, id, job.first, job.end,
+                                                destination, *stream);
+        Settle(completion);
+        std::string error;
+        if (!socket_->Send({.kind = TpBulkKind::kOut,
+                            .state = job.state,
+                            .component = job.component,
+                            .is_private = job.is_private,
+                            .transfer = job.transfer,
+                            .first = job.first,
+                            .end = job.end,
+                            .bytes = bytes},
+                           destination, &error)) {
+          return;
+        }
+      } catch (const std::exception& exception) {
+        if (!Fail(job.transfer, exception.what())) {
+          return;
+        }
+      }
+    }
+  }
+  void ReceiveLoop() noexcept {
+    Buffer buffer(owner_);
+    for (;;) {
+      TpBulkHeader header;
+      std::string error;
+      if (!socket_->ReceiveHeader(&header, &error) ||
+          header.kind != TpBulkKind::kIn) {
+        return;
+      }
+      std::span<std::byte> source;
+      try {
+        source = buffer.Get(header.bytes);
+      } catch (const std::exception& exception) {
+        // Nothing in this connection can follow an unread payload.
+        (void)Fail(header.transfer, exception.what());
+        return;
+      }
+      if (!socket_->ReceivePayload(source, &error)) {
+        return;
+      }
+      try {
+        auto& slot = *owner_->slots_.at(header.state);
+        const cache::ComponentId id{header.component};
+        const auto stream = Stream();
+        auto completion =
+            header.is_private != 0
+                ? owner_->adapter_->LoadPrivatePiece(slot, id, header.first,
+                                                     source, *stream)
+                : owner_->adapter_->CopyRowsIn(slot, id, header.first,
+                                               header.end, source, *stream);
+        Settle(completion);
+        if (!socket_->Send(
+                {.kind = TpBulkKind::kInDone, .transfer = header.transfer}, {},
+                &error)) {
+          return;
+        }
+      } catch (const std::exception& exception) {
+        if (!Fail(header.transfer, exception.what())) {
+          return;
+        }
+      }
+    }
+  }
+
+  TpExecutor* owner_;
+  std::shared_ptr<TpBulkSocket> socket_;
+  std::thread out_;
+  std::thread in_;
+  std::mutex mutex_;
+  std::condition_variable wake_;
+  std::deque<TpInstruction> jobs_;
+  bool stopping_{false};
+};
+
+std::size_t TpExecutor::RowBytes(cache::ComponentId id) const {
+  for (const auto& descriptor : adapter_->Components()) {
+    if (descriptor.id == id && cache::HasRows(descriptor.kind)) {
+      return descriptor.row_bytes;
+    }
+  }
+  throw std::invalid_argument("TP transfer names no row component");
+}
+
+TpExecutor::TpExecutor(std::shared_ptr<TextModelRunner> runner,
+                       std::size_t state_count,
+                       std::shared_ptr<TpBulkSocket> bulk,
+                       std::shared_ptr<TpCallScope> scope)
+    : runner_(std::move(runner)), scope_(std::move(scope)) {
+  if (runner_ == nullptr || state_count == 0 || bulk == nullptr) {
+    throw std::invalid_argument(
+        "TP executor needs a runner, a state and a bulk connection");
+  }
+  // The slots' accounting only: rank 1 retains no checkpoints, so nothing here
+  // draws on these limits.
+  constexpr std::size_t kUnlimited = std::size_t{1} << 62;
+  ledger_ = std::make_unique<cache::ResourceLedger>(
+      cache::ResourceLimits{kUnlimited, kUnlimited, kUnlimited, kUnlimited});
+  resources_ = runner_->CreateComponentCacheResources(*ledger_, 0);
+  if (resources_ == nullptr || resources_->adapter == nullptr) {
+    throw std::runtime_error("TP2 needs a runner with a component cache");
+  }
+  adapter_ = resources_->adapter.get();
+  guard_ = std::make_unique<NoBorrowers>();
+  bulk_ = std::make_unique<Bulk>(this, std::move(bulk));
+  // Rank 0 sizes its cache from these before either rank allocates a session.
+  bulk_->SendHello(adapter_->Components());
+  slots_.reserve(state_count);
   states_.reserve(state_count);
   for (std::size_t index = 0; index < state_count; ++index) {
-    auto state = runner_->CreateState();
+    slots_.push_back(adapter_->CreateSlot(*guard_));
+    auto state = runner_->BindComponentState(*adapter_, *slots_.back());
     if (state == nullptr) {
       throw std::runtime_error("TP executor state creation failed");
     }
     states_.push_back(std::move(state));
   }
+  bulk_->Start();
   // Rank 0's scheduler prepares its vocabulary before serving; rank 1 would
   // otherwise build its own inside the first constrained request, while rank 0
   // waits for it in the request's first exchange.
@@ -1526,24 +2218,6 @@ bool TpExecutor::EndScope(std::uint64_t index, std::string* error) {
   return true;
 }
 
-void TpExecutor::DropSnapshot(std::uint64_t id) {
-  if (id == 0)
-    throw std::logic_error("unknown snapshot drop ID");
-  // Rank 0 drops the ID of a capture that failed before this rank recorded
-  // it: retire the ID so that rank 0 cannot reuse it.
-  last_snapshot_id_ = std::max(last_snapshot_id_, id);
-  const auto found = snapshots_.find(id);
-  if (found != snapshots_.end()) {
-    if (const auto staged = staged_.find(id); staged != staged_.end()) {
-      staged_bytes_ -= staged->second;
-      staged_.erase(staged);
-    } else {
-      snapshot_bytes_ -= found->second->PayloadBytes();
-    }
-    snapshots_.erase(found);
-  }
-}
-
 bool TpExecutor::Execute(const TpControlCommand& command,
                          const Respond& respond, std::string* error) {
   if (command.kind == TpControlCommandKind::kSingle) {
@@ -1553,6 +2227,12 @@ bool TpExecutor::Execute(const TpControlCommand& command,
     return false;
   }
   const auto& instruction = command.instruction;
+  if (instruction.op == TpInstructionOp::kBeginRestore ||
+      instruction.op == TpInstructionOp::kValidate ||
+      instruction.op == TpInstructionOp::kReconcile ||
+      instruction.op == TpInstructionOp::kCopyOut) {
+    return ExecuteCacheOp(command.sequence, instruction, respond, error);
+  }
   if (instruction.op == TpInstructionOp::kAdvanceBatch ||
       instruction.op == TpInstructionOp::kDecodeBatch) {
     return ExecuteBatch(instruction, error);
@@ -1646,29 +2326,71 @@ bool TpExecutor::Open(const TpControlCommand& begin, std::string* error) {
 bool TpExecutor::ExecuteIdle(const TpInstruction& instruction,
                              std::string* error) {
   if (instruction.op != TpInstructionOp::kInvalidate &&
-      instruction.op != TpInstructionOp::kDrop &&
-      instruction.op != TpInstructionOp::kPersist &&
       instruction.op != TpInstructionOp::kPromptContext) {
     SetError(error, "TP worker received a model call outside a request");
     return false;
   }
   try {
-    if (instruction.op == TpInstructionOp::kDrop) {
-      DropSnapshot(instruction.snapshot_id);
-    } else if (instruction.op == TpInstructionOp::kPersist) {
-      // Best effort, like rank 0's write: a snapshot rank 1 skipped or a
-      // write it cannot queue only makes a later restore of the file a miss.
-      const auto found = snapshots_.find(instruction.snapshot_id);
-      if (disk_ != nullptr && found != snapshots_.end()) {
-        (void)disk_->PersistAsync(instruction.file_key, runner_, found->second);
-      }
-    } else if (instruction.op == TpInstructionOp::kPromptContext) {
+    if (instruction.op == TpInstructionOp::kPromptContext) {
       runner_->SetPromptContext(StateFor(instruction.state), nullptr);
     } else {
+      // A restore rank 0 abandoned leaves the slot refusing execution; this
+      // rank's adapter makes it an empty slot again.
       StateFor(instruction.state).Invalidate();
     }
   } catch (const std::exception& exception) {
     SetError(error, exception.what());
+    return false;
+  }
+  return true;
+}
+
+bool TpExecutor::ExecuteCacheOp(std::uint64_t sequence,
+                                const TpInstruction& instruction,
+                                const Respond& respond, std::string* error) {
+  std::string call_error;
+  try {
+    if (instruction.state >= slots_.size()) {
+      throw std::out_of_range("TP cache instruction names no slot");
+    }
+    auto& slot = *slots_[instruction.state];
+    std::vector<cache::ComponentPosition> positions;
+    positions.reserve(instruction.positions.size());
+    for (const auto& [component, rows] : instruction.positions) {
+      positions.push_back({{component}, rows});
+    }
+    switch (instruction.op) {
+      case TpInstructionOp::kBeginRestore:
+        adapter_->BeginRestore(slot, positions);
+        break;
+      case TpInstructionOp::kValidate:
+        if (!adapter_->Validate(slot, positions)) {
+          throw std::runtime_error("rank 1 refused the restored state");
+        }
+        break;
+      case TpInstructionOp::kReconcile:
+        runner_->ReconcileComponentState(StateFor(instruction.state),
+                                         instruction.first);
+        break;
+      case TpInstructionOp::kCopyOut:
+        bulk_->EnqueueOut(instruction);
+        break;
+      default:
+        throw std::logic_error("not a TP cache instruction");
+    }
+  } catch (const std::exception& exception) {
+    call_error = "rank 1 " + std::string(OpName(instruction.op)) +
+                 " failed: " + exception.what();
+  }
+  if (TpCacheAcknowledged(instruction.op)) {
+    return respond({.instruction_index = instruction.index,
+                    .sequence = sequence,
+                    .error = call_error,
+                    .kind = TpControlResponseKind::kInstruction},
+                   error);
+  }
+  if (!call_error.empty()) {
+    SetError(error, call_error);
     return false;
   }
   return true;
@@ -1697,58 +2419,6 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
     // ranks alike.
     state.SetStopAtEos(request.stop_at_eos);
     switch (instruction.op) {
-      case TpInstructionOp::kSnapshot: {
-        if (instruction.snapshot_id <= last_snapshot_id_)
-          throw std::logic_error("reused snapshot ID");
-        last_snapshot_id_ = instruction.snapshot_id;
-        // Rank 0 sent the request's calls so far: capture only a state both
-        // ranks reached the same way, so the snapshot is reusable at once.
-        if (instruction.count != request.count ||
-            instruction.digest != request.digest.value() ||
-            !request.failure.empty())
-          throw std::runtime_error("the ranks diverged before this capture");
-        const auto estimate = runner_->SnapshotPayloadBytes(state);
-        // Rank 0 captures a prompt its RAM cache refused for the disk cache
-        // alone, within disk staging. Without the same room here, a prompt
-        // whose snapshot exceeds the RAM budget would never reach the disk.
-        const std::size_t staging =
-            disk_ != nullptr && instruction.offset != 0
-                ? disk_->staging_capacity_bytes() - staged_bytes_
-                : 0;
-        const bool staged = estimate > snapshot_budget_ - snapshot_bytes_;
-        if (staged && estimate > staging)
-          throw std::runtime_error("worker snapshot budget exhausted");
-        // A snapshot for the disk cache is complete, as on rank 0: the
-        // writer thread must not read rows the session still shares.
-        auto snapshot = instruction.offset != 0
-                            ? runner_->SnapshotForPersistence(state)
-                            : runner_->Snapshot(state);
-        if (!snapshot)
-          throw std::runtime_error("snapshot capture returned null");
-        const auto bytes = snapshot->PayloadBytes();
-        if (bytes > (staged ? staging : snapshot_budget_ - snapshot_bytes_))
-          throw std::runtime_error("worker snapshot exceeds reserved budget");
-        snapshots_.emplace(instruction.snapshot_id, std::move(snapshot));
-        if (staged) {
-          staged_.emplace(instruction.snapshot_id, bytes);
-          staged_bytes_ += bytes;
-        } else {
-          snapshot_bytes_ += bytes;
-        }
-        break;
-      }
-      case TpInstructionOp::kDrop:
-        DropSnapshot(instruction.snapshot_id);
-        break;
-      case TpInstructionOp::kRestore: {
-        choice.reset();
-        const auto found = snapshots_.find(instruction.snapshot_id);
-        if (found == snapshots_.end())
-          throw std::logic_error("unknown snapshot ID");
-        runner_->RestoreOrFork(state, *found->second);
-        request.digest.Add(runner_->CheckpointPosition(state));
-        break;
-      }
       case TpInstructionOp::kReuse:
         choice.reset();
         if (!prompt_fits)
@@ -1762,12 +2432,6 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
         break;
       case TpInstructionOp::kCancelPrepare:
         runner_->PrepareCancellation(state);
-        break;
-      case TpInstructionOp::kRestoreDisk:
-        choice.reset();
-        if (disk_ == nullptr)
-          throw std::runtime_error("rank 1 has no disk cache");
-        disk_->Restore(instruction.file_key, *runner_, state);
         break;
       case TpInstructionOp::kPromptContext:
         DigestTpContext(request.digest, request.images);
@@ -1786,6 +2450,8 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
           TextRunnerState& state;
           ~ClearLookahead() { state.SetPrefillLookahead({}); }
         } clear_lookahead{state};
+        state.SetPrefillPromptEnd(instruction.prompt_size +
+                                  instruction.lookahead);
         state.SetPrefillLookahead(
             std::span<const TextRunnerToken>(request.prompt)
                 .subspan(instruction.prompt_size)
@@ -1846,7 +2512,10 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
       }
       case TpInstructionOp::kAdvanceBatch:
       case TpInstructionOp::kDecodeBatch:
-      case TpInstructionOp::kPersist:
+      case TpInstructionOp::kBeginRestore:
+      case TpInstructionOp::kValidate:
+      case TpInstructionOp::kReconcile:
+      case TpInstructionOp::kCopyOut:
       case TpInstructionOp::kEnd:
       case TpInstructionOp::kNone:
         throw std::logic_error("TP instruction has no model call");
@@ -1854,15 +2523,8 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
   } catch (const std::exception& exception) {
     call_error = "rank 1 " + std::string(OpName(instruction.op)) +
                  " failed: " + exception.what();
-    // A failed capture only means no snapshot: the acknowledgement makes
-    // rank 0 skip it too and drop the ID, and neither state changed. A failed
-    // disk restore is a cache miss: rank 0's cache resets the state on both
-    // ranks and prefills instead.
-    if (instruction.op != TpInstructionOp::kSnapshot &&
-        instruction.op != TpInstructionOp::kRestoreDisk) {
-      DigestTpFailure(request.digest);
-      request.Note(call_error);
-    }
+    DigestTpFailure(request.digest);
+    request.Note(call_error);
   }
   if (forward && !EndScope(instruction.index, error)) {
     if (!call_error.empty() && error != nullptr) {

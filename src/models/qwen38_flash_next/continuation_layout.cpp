@@ -21,7 +21,8 @@ bool IsPool(ContinuationPart part) {
 
 ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
                                        std::uint32_t context,
-                                       std::uint32_t kept_rows)
+                                       std::uint32_t kept_rows,
+                                       const ContinuationRankHeads& rank)
     : context_(context), ratio_(c.compress_ratio), mtp_(mtp) {
   if (!context || context > c.MaxContextLength() || !ratio_ ||
       !c.full_attention_interval || !c.num_layers || !c.AttentionKvDim() ||
@@ -29,7 +30,16 @@ ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
       !c.ssm_head_dim || !c.ssm_num_v_heads || !c.HcDim() || !c.vocab_size ||
       (mtp && !kept_rows))
     throw std::invalid_argument("invalid Flash-Next continuation geometry");
+  if (!rank.layers.empty() &&
+      (rank.layers.size() != c.num_layers || (mtp && !rank.draft_kv_dim)))
+    throw std::invalid_argument("invalid Flash-Next rank continuation heads");
   raw_capacity_ = std::min(context, std::max(c.indexer_top_k, ratio_ - 1));
+  const auto kv_dim = [&](std::uint32_t layer) {
+    return rank.layers.empty() ? std::size_t{c.AttentionKvDim()}
+                               : rank.layers[layer].attention_kv_dim;
+  };
+  const std::size_t draft_kv_dim =
+      rank.layers.empty() ? std::size_t{c.AttentionKvDim()} : rank.draft_kv_dim;
   const auto add = [&](ContinuationPart part, std::size_t row,
                        std::size_t state, std::uint32_t layer = 0) {
     const auto id = static_cast<std::uint32_t>(components_.size() + 1);
@@ -49,18 +59,20 @@ ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
   for (std::uint32_t layer = 0; layer < c.num_layers; ++layer) {
     if (c.IsLinearLayer(layer)) {
       add(ContinuationPart::kConvolution, 0,
-          std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels() *
+          std::size_t{c.ssm_conv_kernel - 1} *
+              (rank.layers.empty() ? std::size_t{c.SsmConvChannels()}
+                                   : rank.layers[layer].conv_channels) *
               sizeof(float),
           layer);
       add(ContinuationPart::kRecurrent, 0,
-          std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim *
+          (rank.layers.empty() ? std::size_t{c.ssm_num_v_heads} *
+                                     c.ssm_head_dim * c.ssm_head_dim
+                               : rank.layers[layer].recurrent_floats) *
               sizeof(float),
           layer);
     } else {
-      add(ContinuationPart::kKey, std::size_t{c.AttentionKvDim()} * 2, 0,
-          layer);
-      add(ContinuationPart::kValue, std::size_t{c.AttentionKvDim()} * 2, 0,
-          layer);
+      add(ContinuationPart::kKey, kv_dim(layer) * 2, 0, layer);
+      add(ContinuationPart::kValue, kv_dim(layer) * 2, 0, layer);
       add(ContinuationPart::kPooledKeys, std::size_t{c.indexer_head_dim} * 2, 0,
           layer);
       add(ContinuationPart::kRawKeys, 0,
@@ -72,8 +84,8 @@ ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
     add(ContinuationPart::kPleHistory, 0,
         std::size_t{c.PleConvHistory()} * c.HcDim() * sizeof(float));
   if (mtp) {
-    add(ContinuationPart::kDraftKey, std::size_t{c.AttentionKvDim()} * 2, 0);
-    add(ContinuationPart::kDraftValue, std::size_t{c.AttentionKvDim()} * 2, 0);
+    add(ContinuationPart::kDraftKey, draft_kv_dim * 2, 0);
+    add(ContinuationPart::kDraftValue, draft_kv_dim * 2, 0);
     add(ContinuationPart::kDraftPooledKeys, std::size_t{c.indexer_head_dim} * 2,
         0);
     add(ContinuationPart::kDraftRawKeys, 0,

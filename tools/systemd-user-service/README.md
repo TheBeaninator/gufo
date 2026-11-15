@@ -96,9 +96,9 @@ it, and the head hands it to the worker. Model load takes ~25 s per rank; the se
 
 ## Disk cache
 
-Both ranks keep their half of each continuation snapshot under
-`<cache>/gufo-tp2/<quant>` on their own disk, so cached prompts survive a
-restart. `GUFO_CACHE_DISK_BYTES` bounds each rank (default 64 GiB).
+The head keeps both ranks' continuation checkpoints under
+`<cache>/gufo-tp2/<quant>` on its own disk, so cached prompts survive a
+restart. `GUFO_CACHE_DISK_BYTES` bounds it (default 64 GiB).
 `<cache>/gufo` keeps the model files' identity digests, so a restart skips
 hashing the full weights again (over a minute for Q8). `<cache>` is
 `GUFO_CACHE_DIR` from `head.env`, or each host's `~/.cache`.

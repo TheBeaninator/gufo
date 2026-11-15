@@ -94,8 +94,7 @@ int main() {
   Require(server != nullptr, server_error);
   Require(client != nullptr, client_error);
 
-  TpControlConfig rank0{.snapshot_budget_bytes = 8192,
-                        .rank = 0,
+  TpControlConfig rank0{.rank = 0,
                         .world_size = 2,
                         .max_context = 4096,
                         .max_draft_tokens = 7,
@@ -104,7 +103,6 @@ int main() {
                         .prefill_chunk_tokens = 512};
   TpControlConfig rank1 = rank0;
   rank1.rank = 1;
-  rank1.snapshot_budget_bytes = 4096;
   bool server_handshake = false;
   bool client_handshake = false;
   std::thread server_handshake_thread(
@@ -115,9 +113,6 @@ int main() {
   client_handshake_thread.join();
   Require(server_handshake, server_error);
   Require(client_handshake, client_error);
-  Require(server->snapshot_budget_bytes() == 4096 &&
-              client->snapshot_budget_bytes() == 4096,
-          "cache budget is the smaller host budget");
 
   TpControlCommand command{.sequence = 7,
                            .max_tokens = 4,
@@ -339,26 +334,35 @@ int main() {
        .instruction = {
            .op = TpInstructionOp::kInvalidate, .index = 13, .state = 0}});
 
-  for (const auto op : {TpInstructionOp::kSnapshot, TpInstructionOp::kRestore,
-                        TpInstructionOp::kDrop}) {
-    round_trip(
-        {.sequence = command.sequence,
-         .kind = TpControlCommandKind::kInstruction,
-         .instruction = {
-             .op = op, .index = 14, .snapshot_id = 0xffffffffffffffffULL}});
+  // The component cache works on slots on its own schedule, within a request
+  // or between requests.
+  for (const std::uint64_t sequence : {std::uint64_t{0}, command.sequence}) {
+    for (const auto op :
+         {TpInstructionOp::kBeginRestore, TpInstructionOp::kValidate}) {
+      round_trip({.sequence = sequence,
+                  .kind = TpControlCommandKind::kInstruction,
+                  .instruction = {.op = op,
+                                  .index = 14,
+                                  .state = 3,
+                                  .positions = {{1, 2048}, {2, 0}}}});
+    }
+    round_trip({.sequence = sequence,
+                .kind = TpControlCommandKind::kInstruction,
+                .instruction = {.op = TpInstructionOp::kReconcile,
+                                .index = 15,
+                                .state = 3,
+                                .first = 2048}});
+    round_trip({.sequence = sequence,
+                .kind = TpControlCommandKind::kInstruction,
+                .instruction = {.op = TpInstructionOp::kCopyOut,
+                                .index = 15,
+                                .state = 3,
+                                .transfer = 0xfedcba9876543210ULL,
+                                .component = 2,
+                                .is_private = 1,
+                                .first = 16,
+                                .end = 32}});
   }
-  // A snapshot for the disk cache is complete on rank 1 too.
-  round_trip({.sequence = command.sequence,
-              .kind = TpControlCommandKind::kInstruction,
-              .instruction = {.op = TpInstructionOp::kSnapshot,
-                              .index = 14,
-                              .offset = 1,
-                              .snapshot_id = 20}});
-  round_trip(
-      {.sequence = 0,
-       .kind = TpControlCommandKind::kInstruction,
-       .instruction = {
-           .op = TpInstructionOp::kDrop, .index = 15, .snapshot_id = 19}});
   round_trip(
       {.sequence = command.sequence,
        .kind = TpControlCommandKind::kInstruction,
@@ -402,15 +406,6 @@ int main() {
   member_plans.instruction.batch_drafts = 0;
   member_plans.instruction.batch[0].drafts = 3;
   round_trip(member_plans);
-  // A capture carries the request's call count and digest so far.
-  round_trip({.sequence = command.sequence,
-              .kind = TpControlCommandKind::kInstruction,
-              .instruction = {.op = TpInstructionOp::kSnapshot,
-                              .index = 18,
-                              .state = 1,
-                              .count = 41,
-                              .digest = 0x1234,
-                              .snapshot_id = 7}});
   // Binding a state to its request's prompt context belongs to the request;
   // releasing it can happen between requests.
   round_trip(
@@ -423,23 +418,9 @@ int main() {
        .kind = TpControlCommandKind::kInstruction,
        .instruction = {
            .op = TpInstructionOp::kPromptContext, .index = 20, .state = 3}});
-  // The disk cache: persisting a snapshot happens between requests, a disk
-  // restore within one; both name rank 1's file by its key.
-  round_trip({.sequence = 0,
-              .kind = TpControlCommandKind::kInstruction,
-              .instruction = {.op = TpInstructionOp::kPersist,
-                              .index = 21,
-                              .snapshot_id = 19,
-                              .file_key = 0xfedcba9876543210ULL}});
-  round_trip({.sequence = command.sequence,
-              .kind = TpControlCommandKind::kInstruction,
-              .instruction = {.op = TpInstructionOp::kRestoreDisk,
-                              .index = 22,
-                              .state = 2,
-                              .file_key = 0xfedcba9876543210ULL}});
   const TpControlResponse ack{.instruction_index = 17,
                               .sequence = command.sequence,
-                              .error = "capture failed",
+                              .error = "restore failed",
                               .kind = TpControlResponseKind::kInstruction};
   Require(client->SendResponse(ack, &client_error), client_error);
   TpControlResponse got_ack;
@@ -476,21 +457,6 @@ int main() {
   refuses("a client id", with([](auto& bad) { bad.client_id = "probe"; }));
   refuses("a prompt context",
           with([](auto& bad) { bad.prompt_context = {1, 2, 3}; }));
-  refuses("a file key outside the disk cache",
-          with([](auto& bad) { bad.instruction.file_key = 5; }));
-  refuses("a persist without a file key", with([](auto& bad) {
-            bad.sequence = 0;
-            bad.instruction = {.op = TpInstructionOp::kPersist,
-                               .snapshot_id = 4};
-          }));
-  refuses("a disk restore without a file key", with([](auto& bad) {
-            bad.instruction = {.op = TpInstructionOp::kRestoreDisk};
-          }));
-  refuses("a disk restore outside a request", with([](auto& bad) {
-            bad.sequence = 0;
-            bad.instruction = {.op = TpInstructionOp::kRestoreDisk,
-                               .file_key = 9};
-          }));
   refuses("a prompt-context binding with a token", with([](auto& bad) {
             bad.instruction = {.op = TpInstructionOp::kPromptContext,
                                .token = 4};
@@ -518,20 +484,35 @@ int main() {
   refuses("a one-token decode", with([](auto& bad) {
             bad.instruction = {.op = TpInstructionOp::kDecode, .count = 1};
           }));
-  refuses("a snapshot with ID zero", with([](auto& bad) {
-            bad.instruction = {.op = TpInstructionOp::kSnapshot};
+  refuses("a copy without a transfer", with([](auto& bad) {
+            bad.instruction = {
+                .op = TpInstructionOp::kCopyOut, .first = 0, .end = 4};
           }));
-  refuses("an unknown snapshot kind", with([](auto& bad) {
-            bad.instruction = {.op = TpInstructionOp::kSnapshot,
-                               .offset = 2,
-                               .snapshot_id = 1};
+  refuses("a transfer outside a copy",
+          with([](auto& bad) { bad.instruction.transfer = 1; }));
+  refuses("an empty copy", with([](auto& bad) {
+            bad.instruction = {.op = TpInstructionOp::kCopyOut,
+                               .transfer = 1,
+                               .first = 4,
+                               .end = 4};
           }));
-  refuses("a stray snapshot ID",
-          with([](auto& bad) { bad.instruction.snapshot_id = 1; }));
-  refuses("idle restore", with([](auto& bad) {
-            bad.sequence = 0;
-            bad.instruction = {.op = TpInstructionOp::kRestore,
-                               .snapshot_id = 1};
+  refuses("an unknown copy kind", with([](auto& bad) {
+            bad.instruction = {.op = TpInstructionOp::kCopyOut,
+                               .transfer = 1,
+                               .is_private = 2,
+                               .end = 4};
+          }));
+  refuses("a component outside a copy",
+          with([](auto& bad) { bad.instruction.component = 1; }));
+  refuses("a row range outside a copy",
+          with([](auto& bad) { bad.instruction.end = 1; }));
+  refuses("positions outside a restore",
+          with([](auto& bad) { bad.instruction.positions = {{1, 1}}; }));
+  refuses("a restore without positions", with([](auto& bad) {
+            bad.instruction = {.op = TpInstructionOp::kBeginRestore};
+          }));
+  refuses("a validation without positions", with([](auto& bad) {
+            bad.instruction = {.op = TpInstructionOp::kValidate};
           }));
   refuses("a missing operation", with([](auto& bad) { bad.instruction = {}; }));
   refuses("a model call outside a request",
@@ -734,8 +715,6 @@ int main() {
                    [](TpControlConfig& config) { config.sessions = 4; });
   refuses_mismatch("vision",
                    [](TpControlConfig& config) { config.vision = true; });
-  refuses_mismatch("disk cache",
-                   [](TpControlConfig& config) { config.disk_cache = true; });
   refuses_mismatch("YaRN", [](TpControlConfig& config) { config.yarn = true; });
   refuses_mismatch("context",
                    [](TpControlConfig& config) { config.max_context = 8192; });

@@ -15,7 +15,7 @@ nix shell --inputs-from . nixpkgs#clang-tools -c python3 tools/ci/check-format.p
 nix build .#checks.x86_64-linux.docs
 
 # Hosted CPU/repository checks
-nix build .#checks.x86_64-linux.pr
+nix flake check
 
 # Focused test (replace the target and expression)
 nix develop -c cmake --preset gpu-test
@@ -39,34 +39,85 @@ Selection by preset: `gpu-fast` excludes `slow` and `external-model` tests,
 their documented local artifacts. A skip due to an absent model or device is
 not a quality pass.
 
-## Hosted versus local checks
+## PNG decoding
 
-GitHub runs formatting, documentation, dependency-inventory and server-command
-checks plus `cmake/Checks.cmake`: parsing, GGUF safety, sampling, templates,
-server/cache/scheduler behavior, model configuration and small audio/video API
-contracts. It builds only those test executables and the CPU CLI. It does not
-build ROCm, download weights, run full H3 oracles or compile whole-tree clang-tidy.
-The workflow cancels superseded runs and has a 25-minute limit.
+The Rust decoder uses the toolchain pinned in `rust-toolchain.toml`.
+`nix build .#checks.x86_64-linux.rust` checks rustfmt and clippy offline, and
+`nix flake check` includes it; the CMake `check-pr` target does not lint Rust.
+Outside Nix, run:
 
 ```sh
-# Same hosted C++/CLI selection locally
+cargo fmt --manifest-path src/core/png_decode/Cargo.toml --check
+cargo clippy --manifest-path src/core/png_decode/Cargo.toml --locked --all-targets -- -D warnings
+```
+
+CMake Debug builds use Cargo's development profile. RelWithDebInfo uses an
+optimized profile with full debug information; with `BUILD_TESTING=ON` that
+profile also enables debug assertions and overflow checks, matching the C++
+test assertions, while shipped builds leave them off. Other configurations use
+the release profile. CMake invokes Cargo on every build, leaving incremental
+rebuild decisions to Cargo, and links the native system libraries that the
+configured `rustc` reports for its standard library. The C++
+sanitizer preset does not instrument the Rust library; it uses the development
+profile when configured as Debug.
+
+`png_decode_test` decodes generated PNGs and chunk edits with `DecodeImage` and
+with a frozen copy of the libpng decoder from 0.28.1 in
+`tests/core/png_reference.cpp`. The pixels, or the exception type and message,
+must match unless the case is in `kKnownDeviations`. It runs in `check-pr`.
+
+`png_decode_test --corpus DIR... [--repeat N]` runs the same comparison over
+the `.png` files under each directory and prints the median decode time of both
+decoders per file. CTest does not run this mode.
+
+## Hosted versus local checks
+
+GitHub runs `nix flake check`: formatting, documentation, dependency inventory,
+server-command checks and one CPU build/test derivation. The CPU suite selects
+168 tests, runs with up to four CTest slots, and validates a separate lock-mode
+CLI build. It does not build ROCm, download weights, run H3 qualification or run
+whole-tree clang-tidy. Missing-model skips remain visible and are not quality
+passes. The workflow cancels superseded runs and has a 25-minute limit.
+
+```sh
+# Focused CMake contract subset for local iteration (also used on Windows)
 cmake --preset cpu-test
 cmake --build --preset pr --parallel 4
 
-# Full CPU suite, or explicit non-hosted tools
+# Individual CPU check, or explicit qualification tools
 nix build .#checks.x86_64-linux.tests
-nix build .#checks.x86_64-linux.static-analysis
-nix build .#checks.x86_64-linux.h3-manifest
-nix build .#checks.x86_64-linux.h3-quality
-nix build .#checks.x86_64-linux.h3-ml-quality
+nix build .#static-analysis
+nix build .#h3-manifest
+nix build .#h3-quality
+nix build .#h3-ml-quality
 ```
+
+Static analysis and the three H3 qualification packages above are explicit-only: `nix flake check`
+excludes them and the six CTest suites labelled `h3-qualification`. Their tests
+remain available through those packages or an explicit local CTest selection.
+
+The default Nix CPU suite also excludes `serving_bench_test`. Run its mocked
+benchmark-client/reporting regressions explicitly when changing those tools:
+
+```sh
+nix develop .#checks.x86_64-linux.tests -c python3 tests/tools/serving_bench_test.py
+```
+
+The default `.clang-tidy` runs the static analyzer and selected correctness
+checks. Run it explicitly against an affected source file:
+
+```sh
+nix develop -c clang-tidy -p build/cpu-test src/core/json.cpp
+```
+
+The compilation database must already be configured (the `cpu-test` preset
+exports it).
 
 Full CPU builds need Python NumPy for the offline tool tests. GPU model oracles
 need the documented local weights; use focused targets and CTest labels before
 running the complete tree. H3 development normally needs an analytic primitive,
 one transformer block or one denoiser forward. Full video generation and LPIPS
-are release/quality qualification, not routine PR work. `nix flake check` runs
-all declared checks and is deliberately not the hosted CI command.
+are release/quality qualification, not routine PR work. `nix flake check` is the canonical hosted CI command.
 
 For Qwen image-prefix changes, build `qwen_vision_serving_test` with `gpu-test`
 and run it with `MODEL DRAFT_OR_DASH IMAGE_DIRECTORY --append-only`.

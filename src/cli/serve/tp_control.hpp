@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "src/core/sampling.hpp"
@@ -18,7 +19,6 @@
 namespace gufo::server {
 
 struct TpControlConfig {
-  std::uint64_t snapshot_budget_bytes{0};
   std::uint32_t rank{0};
   std::uint32_t world_size{1};
   std::uint32_t max_context{4096};
@@ -32,8 +32,6 @@ struct TpControlConfig {
   /// Both ranks load the vision encoder, or neither: rank 1 encodes the images
   /// of every request itself.
   bool vision{false};
-  /// Both ranks keep a disk cache (`--cache-disk`), or neither.
-  bool disk_cache{false};
   /// Both ranks apply static YaRN (`--enable-yarn`), or neither: a rank that
   /// rotates positions differently reads another model's attention.
   bool yarn{false};
@@ -51,7 +49,7 @@ enum class TpControlCommandKind : std::uint8_t {
 /// The model call an instruction asks rank 1 to make.
 enum class TpInstructionOp : std::uint8_t {
   kNone = 0,
-  /// Reset the state's model session. The continuation cache decides this, so
+  /// Reset the state's model session. The component cache decides this, so
   /// it may arrive between requests (sequence 0) as well as within one.
   kInvalidate = 1,
   /// `Prefill(state, prompt[0, prompt_size), offset, count)`, where the prompt
@@ -67,9 +65,6 @@ enum class TpInstructionOp : std::uint8_t {
   /// The request is over. `count` is the number of instructions rank 0 sent
   /// for it and `digest` its execution digest; rank 1 compares both.
   kEnd = 5,
-  kSnapshot = 6,
-  kDrop = 7,
-  kRestore = 8,
   kReuse = 9,
   kCancelPrepare = 10,
   /// `AdvanceBatch` over `batch`, in order: one forward advances every listed
@@ -80,15 +75,20 @@ enum class TpInstructionOp : std::uint8_t {
   /// the model state to the request's prompt context (its images, if any), as
   /// the pool does whenever it leases a state; with sequence 0 it clears it.
   kPromptContext = 12,
-  /// Persist the snapshot `snapshot_id` to rank 1's disk cache under
-  /// `file_key`, in the background. Rank 0 writes its own half of the same
-  /// snapshot to its disk cache; a failed or skipped write on rank 1 only
-  /// turns a later restore into a cache miss. Sent with sequence 0.
-  kPersist = 13,
-  /// Restore the state from rank 1's disk-cache file `file_key`, as rank 0
-  /// restores its own half. Acknowledged; a failure makes both ranks treat the
-  /// entry as a miss.
-  kRestoreDisk = 14,
+  /// Rank 0's cache starts restoring `positions` into the state's slot; rows
+  /// and private state follow on the bulk connection. Acknowledged, like every
+  /// call that changes what the cache may do next. The cache ops below belong
+  /// to no request: it runs them while it assigns slots, and sends sequence 0.
+  kBeginRestore = 16,
+  /// The restore of `positions` is complete. Acknowledged: an error makes rank
+  /// 0's cache fall back to a cold state on both ranks.
+  kValidate = 17,
+  /// `ReconcileComponentState(state, first)`.
+  kReconcile = 18,
+  /// Send rank 1's rows [first, end) of `component`, or its private state's
+  /// bytes [first, end) with `is_private`, as bulk transfer `transfer`. The
+  /// control channel orders this after the calls that produced them.
+  kCopyOut = 19,
   /// `DecodeBatch` over `batch`: one multi-token cycle for every member, with
   /// the batch's draft count from `batch_drafts` (the plan rank 0 chose, plus
   /// one; zero lets each member use its own `drafts`). Sent with
@@ -122,8 +122,6 @@ struct TpInstruction {
   std::uint64_t index{0};
   std::uint32_t state{0};
   std::int32_t token{0};
-  /// Op-specific; for kSnapshot, 1 when the snapshot must be complete rather
-  /// than share the session's rows (SnapshotForPersistence).
   std::uint32_t offset{0};
   std::uint32_t count{0};
   std::uint32_t prompt_size{0};
@@ -132,12 +130,19 @@ struct TpInstruction {
   /// none) before the call.
   std::uint64_t rng{0};
   std::int32_t pending{-1};
-  std::uint64_t snapshot_id{0};
+  /// kCopyOut only.
+  std::uint64_t transfer{0};
+  std::uint32_t component{0};
+  std::uint32_t is_private{0};
+  /// kCopyOut and kReconcile only.
+  std::uint64_t first{0};
+  std::uint64_t end{0};
+  /// kBeginRestore and kValidate only: rank 1's component positions, as
+  /// (component, valid rows).
+  std::vector<std::pair<std::uint32_t, std::uint64_t>> positions;
   /// kAdvanceBatch and kDecodeBatch only: two to eight members on distinct
   /// states; a decode batch's members also serve distinct requests.
   std::vector<TpBatchMember> batch;
-  /// kPersist and kRestoreDisk only: names the snapshot's file on both ranks.
-  std::uint64_t file_key{0};
   /// kDecodeBatch only: the batch's draft count plus one, or zero for none.
   std::uint32_t batch_drafts{0};
   /// kDecode only: the step's draft count plus one, or zero for none.
@@ -290,9 +295,6 @@ public:
   /// Wake a blocked directional reader/writer during broker shutdown.
   void Interrupt() noexcept;
 
-  [[nodiscard]] std::uint64_t snapshot_budget_bytes() const noexcept {
-    return snapshot_budget_bytes_;
-  }
   [[nodiscard]] std::uint16_t port() const noexcept;
   [[nodiscard]] std::uint32_t rank() const noexcept;
   [[nodiscard]] std::uint32_t world_size() const noexcept;
@@ -317,7 +319,6 @@ private:
   std::uint32_t world_size_{1};
   std::uint32_t max_context_{0};
   bool handshaken_{false};
-  std::uint64_t snapshot_budget_bytes_{0};
   std::mutex send_mutex_;
   std::mutex receive_mutex_;
   std::atomic<bool> interrupted_{false};

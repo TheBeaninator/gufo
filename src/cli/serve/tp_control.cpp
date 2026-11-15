@@ -49,6 +49,8 @@ constexpr std::size_t kMaxBatchMembers = 8;
 constexpr std::size_t kMaxClientIdBytes = 4096;
 constexpr std::size_t kMaxErrorBytes = 1U << 20;
 constexpr std::size_t kMaxAuthTokenBytes = 4096;
+/// Far above any model's component count; bounds a corrupt frame.
+constexpr std::size_t kMaxCachePositions = 4096;
 constexpr auto kIoTimeout = std::chrono::seconds(30);
 
 void SetError(std::string* error, std::string message) {
@@ -68,7 +70,7 @@ bool ControlMac(const std::string& token, std::uint32_t sender,
                 std::span<const std::uint8_t> rank0_nonce,
                 std::span<const std::uint8_t> rank1_nonce,
                 std::array<std::uint8_t, kMacBytes>* mac) {
-  constexpr std::string_view kLabel = "gufo tp2 control v20";
+  constexpr std::string_view kLabel = "gufo tp2 control v21";
   std::vector<std::uint8_t> message(kLabel.begin(), kLabel.end());
   message.push_back(static_cast<std::uint8_t>(sender));
   message.insert(message.end(), rank0_nonce.begin(), rank0_nonce.end());
@@ -235,18 +237,21 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
     SetError(error, "TP instruction carries a draft count it does not use");
     return false;
   }
-  const bool snapshot_op = instruction.op == TpInstructionOp::kSnapshot ||
-                           instruction.op == TpInstructionOp::kRestore ||
-                           instruction.op == TpInstructionOp::kDrop ||
-                           instruction.op == TpInstructionOp::kPersist;
-  if (snapshot_op != (instruction.snapshot_id != 0)) {
-    SetError(error, "TP instruction snapshot ID is invalid");
+  const bool copy_op = instruction.op == TpInstructionOp::kCopyOut;
+  if (copy_op != (instruction.transfer != 0) ||
+      (!copy_op &&
+       (instruction.component != 0 || instruction.is_private != 0)) ||
+      (copy_op && instruction.is_private > 1) ||
+      (!copy_op && instruction.op != TpInstructionOp::kReconcile &&
+       (instruction.first != 0 || instruction.end != 0))) {
+    SetError(error, "TP instruction transfer arguments are invalid");
     return false;
   }
-  const bool disk_op = instruction.op == TpInstructionOp::kPersist ||
-                       instruction.op == TpInstructionOp::kRestoreDisk;
-  if (disk_op != (instruction.file_key != 0)) {
-    SetError(error, "TP instruction file key is invalid");
+  const bool position_op = instruction.op == TpInstructionOp::kBeginRestore ||
+                           instruction.op == TpInstructionOp::kValidate;
+  if (position_op == instruction.positions.empty() ||
+      instruction.positions.size() > kMaxCachePositions) {
+    SetError(error, "TP instruction component positions are invalid");
     return false;
   }
   const bool batch_op = instruction.op == TpInstructionOp::kAdvanceBatch ||
@@ -292,25 +297,21 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
       }
       break;
     }
-    case TpInstructionOp::kDrop:
-    case TpInstructionOp::kPersist:
-      valid = instruction.state == 0 && only(false, false, false, false, false);
-      break;
     case TpInstructionOp::kReuse:
       valid = only(false, false, false, true, false) &&
               instruction.prompt_size <= kMaxPromptTokens;
       break;
-    case TpInstructionOp::kSnapshot:
-      // The request's call count and digest so far; offset 1 asks for a
-      // complete snapshot (for the disk cache).
-      valid = only(false, true, true, false, true) && instruction.offset <= 1;
-      break;
-    case TpInstructionOp::kRestore:
     case TpInstructionOp::kCancelPrepare:
     case TpInstructionOp::kInvalidate:
     case TpInstructionOp::kPromptContext:
-    case TpInstructionOp::kRestoreDisk:
+    case TpInstructionOp::kBeginRestore:
+    case TpInstructionOp::kValidate:
+    case TpInstructionOp::kReconcile:
       valid = only(false, false, false, false, false);
+      break;
+    case TpInstructionOp::kCopyOut:
+      valid = only(false, false, false, false, false) &&
+              instruction.end > instruction.first;
       break;
     case TpInstructionOp::kPrefill:
       valid =
@@ -336,19 +337,21 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
     SetError(error, "TP instruction has invalid arguments for its operation");
     return false;
   }
-  // Only a reset, a snapshot drop or persist, or clearing a prompt context can
-  // happen between requests: the caches make them on their own schedule.
+  // Only a reset, a cache transfer, or clearing a prompt context can happen
+  // between requests: the cache makes them on its own schedule.
   // A batch names its members' requests. Every other call belongs to a
   // request.
   if (sequence == 0 && instruction.op != TpInstructionOp::kInvalidate &&
-      instruction.op != TpInstructionOp::kDrop &&
-      instruction.op != TpInstructionOp::kPersist &&
+      instruction.op != TpInstructionOp::kBeginRestore &&
+      instruction.op != TpInstructionOp::kValidate &&
+      instruction.op != TpInstructionOp::kReconcile &&
+      instruction.op != TpInstructionOp::kCopyOut &&
       instruction.op != TpInstructionOp::kPromptContext &&
       instruction.op != TpInstructionOp::kAdvanceBatch &&
       instruction.op != TpInstructionOp::kDecodeBatch) {
     SetError(error,
-             "TP instruction outside a request must be a reset, a snapshot "
-             "drop or persist, or a prompt-context release");
+             "TP instruction outside a request must be a reset, a cache "
+             "transfer, or a prompt-context release");
     return false;
   }
   return true;
@@ -412,7 +415,7 @@ bool ValidateTpControlResponse(const TpControlResponse& response,
     return false;
   }
   if (response.kind == TpControlResponseKind::kInstruction) {
-    if (response.sequence == 0 || HasResultFields(response)) {
+    if (HasResultFields(response)) {
       SetError(error, "TP cache acknowledgement is invalid");
       return false;
     }
@@ -763,9 +766,7 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   AppendU32(&payload, config.use_mtp ? 1U : 0U);
   AppendU32(&payload, config.sessions);
   AppendU32(&payload, config.vision ? 1U : 0U);
-  AppendU32(&payload, config.disk_cache ? 1U : 0U);
   AppendU32(&payload, config.yarn ? 1U : 0U);
-  AppendU64(&payload, config.snapshot_budget_bytes);
   // The hello is sent before the peer is authenticated, so it carries a nonce
   // and never the token: the listening rank accepts whoever connects first.
   payload.insert(payload.end(), nonce.begin(), nonce.end());
@@ -793,9 +794,7 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   std::uint32_t mtp = 0;
   std::uint32_t sessions = 0;
   std::uint32_t vision = 0;
-  std::uint32_t disk_cache = 0;
   std::uint32_t yarn = 0;
-  std::uint64_t snapshot_budget = 0;
   if (!ReadU32(peer, &offset, &rank, error) ||
       !ReadU32(peer, &offset, &world, error) ||
       !ReadU32(peer, &offset, &context, error) ||
@@ -804,9 +803,7 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
       !ReadU32(peer, &offset, &mtp, error) ||
       !ReadU32(peer, &offset, &sessions, error) ||
       !ReadU32(peer, &offset, &vision, error) ||
-      !ReadU32(peer, &offset, &disk_cache, error) ||
       !ReadU32(peer, &offset, &yarn, error) ||
-      !ReadU64(peer, &offset, &snapshot_budget, error) ||
       peer.size() - offset != kNonceBytes) {
     SetError(error, "TP control hello payload is invalid");
     return false;
@@ -837,8 +834,6 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
   differs(sessions != config.sessions, "sessions", config.sessions, sessions);
   differs(vision != (config.vision ? 1U : 0U), "vision (--mmproj)",
           config.vision ? 1U : 0U, vision);
-  differs(disk_cache != (config.disk_cache ? 1U : 0U),
-          "disk cache (--cache-disk)", config.disk_cache ? 1U : 0U, disk_cache);
   differs(yarn != (config.yarn ? 1U : 0U), "YaRN (--enable-yarn)",
           config.yarn ? 1U : 0U, yarn);
   // Rank 1 proves the token first; rank 0 answers with its own proof only
@@ -888,8 +883,6 @@ bool TpControlChannel::Handshake(const TpControlConfig& config,
     SetError(error, "TP control hello configuration mismatch: " + mismatch);
     return false;
   }
-  snapshot_budget_bytes_ =
-      std::min(config.snapshot_budget_bytes, snapshot_budget);
   world_size_ = config.world_size;
   max_context_ = config.max_context;
   handshaken_ = true;
@@ -982,11 +975,20 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
     AppendU32(&payload, instruction.offset);
     AppendU32(&payload, instruction.count);
     AppendU32(&payload, instruction.prompt_size);
-    AppendU64(&payload, instruction.snapshot_id);
+    AppendU64(&payload, instruction.transfer);
     AppendU64(&payload, instruction.digest);
     AppendU64(&payload, instruction.rng);
     AppendU32(&payload, static_cast<std::uint32_t>(instruction.pending));
-    AppendU64(&payload, instruction.file_key);
+    AppendU32(&payload, instruction.component);
+    AppendU32(&payload, instruction.is_private);
+    AppendU64(&payload, instruction.first);
+    AppendU64(&payload, instruction.end);
+    AppendU32(&payload,
+              static_cast<std::uint32_t>(instruction.positions.size()));
+    for (const auto& [component, rows] : instruction.positions) {
+      AppendU32(&payload, component);
+      AppendU64(&payload, rows);
+    }
     AppendU32(&payload, instruction.batch_drafts);
     AppendU32(&payload, instruction.lookahead);
     AppendU32(&payload, instruction.drafts);
@@ -1161,6 +1163,7 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
     std::uint32_t token_bits = 0;
     std::uint32_t pending_bits = 0;
     std::uint32_t batch_size = 0;
+    std::uint32_t position_count = 0;
     if (!ReadU32(command_prompt_, &offset, &op, error) ||
         !ReadU64(command_prompt_, &offset, &instruction.index, error) ||
         !ReadU32(command_prompt_, &offset, &instruction.state, error) ||
@@ -1168,16 +1171,30 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
         !ReadU32(command_prompt_, &offset, &instruction.offset, error) ||
         !ReadU32(command_prompt_, &offset, &instruction.count, error) ||
         !ReadU32(command_prompt_, &offset, &instruction.prompt_size, error) ||
-        !ReadU64(command_prompt_, &offset, &instruction.snapshot_id, error) ||
+        !ReadU64(command_prompt_, &offset, &instruction.transfer, error) ||
         !ReadU64(command_prompt_, &offset, &instruction.digest, error) ||
         !ReadU64(command_prompt_, &offset, &instruction.rng, error) ||
         !ReadU32(command_prompt_, &offset, &pending_bits, error) ||
-        !ReadU64(command_prompt_, &offset, &instruction.file_key, error) ||
-        !ReadU32(command_prompt_, &offset, &instruction.batch_drafts, error) ||
+        !ReadU32(command_prompt_, &offset, &instruction.component, error) ||
+        !ReadU32(command_prompt_, &offset, &instruction.is_private, error) ||
+        !ReadU64(command_prompt_, &offset, &instruction.first, error) ||
+        !ReadU64(command_prompt_, &offset, &instruction.end, error) ||
+        !ReadU32(command_prompt_, &offset, &position_count, error) ||
+        position_count > kMaxCachePositions) {
+      return reject("TP control instruction is invalid");
+    }
+    instruction.positions.resize(position_count);
+    for (auto& [component, rows] : instruction.positions) {
+      if (!ReadU32(command_prompt_, &offset, &component, error) ||
+          !ReadU64(command_prompt_, &offset, &rows, error)) {
+        return reject("TP control instruction is invalid");
+      }
+    }
+    if (!ReadU32(command_prompt_, &offset, &instruction.batch_drafts, error) ||
         !ReadU32(command_prompt_, &offset, &instruction.lookahead, error) ||
         !ReadU32(command_prompt_, &offset, &instruction.drafts, error) ||
         !ReadU32(command_prompt_, &offset, &batch_size, error) ||
-        op > static_cast<std::uint32_t>(TpInstructionOp::kDecodeBatch) ||
+        op > static_cast<std::uint32_t>(TpInstructionOp::kCopyOut) ||
         batch_size > kMaxBatchMembers) {
       return reject("TP control instruction is invalid");
     }
@@ -1457,8 +1474,9 @@ bool TpResponseBroker::RegisterInstruction(std::uint64_t sequence,
                                            std::uint64_t index,
                                            std::string* error) {
   const std::lock_guard<std::mutex> lock(impl_->mutex);
+  // Sequence zero: a cache operation that belongs to no request.
   if (impl_->stopping || impl_->poisoned || impl_->ack_expected ||
-      !impl_->pending.contains(sequence)) {
+      (sequence != 0 && !impl_->pending.contains(sequence))) {
     SetError(error, "TP cache acknowledgement cannot be registered: " +
                         impl_->failure);
     return false;

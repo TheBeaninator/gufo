@@ -170,10 +170,12 @@ the MTP draft policy on its one-session costs; see gufo-org/gufo#258). Check
 
 Chat and raw completions (including `ignore_eos`), sampling, streaming, stop
 sequences, tool calls, images (`--mmproj` on both ranks), cancellation,
-`--request-timeout-ms`, history reuse and the disk cache (`--cache-disk` on
-both ranks, each on its own disk) work as on one host.
-A RAM cache above the automatic budget needs the same `--cache-ram-bytes` on
-both ranks; the pair uses the smaller of the two ranks' limits.
+`--request-timeout-ms`, history reuse and the disk cache work as on one host.
+Rank 0 owns the whole cache, so `--cache-ram-bytes`, `--cache-disk` and
+`--cache-disk-bytes` belong on rank 0 and rank 1 ignores them. Its RAM and disk
+hold both ranks' state, so the same limit retains about half the conversations
+of one host. The pair also opens a bulk TCP connection on the control port plus
+one, from rank 1 to `--tp-bootstrap-host`, so a firewall must allow both ports.
 Cancellations and timeouts take effect between model calls, so a long prefill
 stops at its next chunk. Up to `--sessions` requests run at once, their
 decoders batched; more wait up to `--max-pending`, the rest get HTTP 429.
@@ -211,7 +213,7 @@ Limits:
   although the probe's single-step prefill picks `update`.
 - Where TP2 is still behind one host (gaps to close, not design choices):
   - No in-pass prompt checkpoint (`PrefillThrough`): the last prefill pass
-    stops at the checkpoint boundary and snapshots there.
+    stops at the checkpoint boundary and captures there.
     `tp_executor_test` fails when the TP2 wrapper turns off a runner
     capability that is not listed there as such a gap.
   - No mid-pass prefill rollback (`prefill_rollback`; so far only Qwen 27B's
@@ -312,10 +314,9 @@ configuration and prepared images) and closes with `kEnd`. Mirrored calls:
   across cache checkpoints;
 - state resets, and binding a state to its request's prompt context (images
   can reset the state);
-- snapshot, restore, prefix reuse and cancellation preparation, each
-  acknowledged by rank 1 before rank 0 continues; snapshot bytes stay on each
-  host, and the budget is the smaller rank's (its automatic budget, or its
-  `--cache-ram-bytes`).
+- what the cache does to a slot (begin restore, validate, reconcile, copy out,
+  prefix reuse, cancellation preparation); those that change a slot are
+  acknowledged by rank 1 before rank 0 continues.
 
 Every model call binds the communicator's scope to its instruction's index on
 both ranks. Rules the compiler does not enforce: every state-changing call must
@@ -323,29 +324,38 @@ pass through the wrapper; a request's cancellation check is never passed to the
 model session, which could strand rank 1 inside an exchange; TP2 must not
 change the cache's boundaries.
 
-**Disk cache.** Each rank keeps its own half of a snapshot on its own disk.
-Rank 0's continuation disk store decides what is saved, restored and evicted,
-as on one host. Its file holds rank 0's half behind a header that names a
-random file key; when it writes the file, rank 1 persists its half under that
-key in the background. Snapshots taken for the disk cache are complete on
-both ranks, so neither writer reads rows its session still shares.
-Restoring a file restores both halves, rank 1's from
-its own directory, acknowledged before rank 0 continues. Rank 1 bounds its
-directory by least-recent use within its own `--cache-disk-bytes`; a missing,
-corrupt or foreign half fails the restore on rank 1, which rank 0's store
-treats as a miss (the state is reset on both ranks and prefilled). TP2 files
-carry the rank in their cache identity, so neither a one-host server nor the
-other rank restores them. Within one process, a file of a request rank 1
-rejected is a miss, and a restore before the verdict depends on it.
+**Cache.** Rank 0 runs the ordinary component cache, unpatched, over
+`TpMirroredRunner::PairAdapter`. The adapter's components are rank 0's, then
+rank 1's under ids offset by `kPeerBase`, then one private `kProducer` holding
+the process nonce and the request that produced the state. Everything above it
+(retention, eviction, branch points, the disk store) therefore sees one model
+with twice the components, and a checkpoint holds both ranks' bytes or neither.
+Rank 1 keeps its slots and states but retains nothing.
+
+Rank 1's bytes cross `TpBulkSocket`, a second TCP connection proving the control
+token, so a restore's gigabytes never delay another request's instructions. A
+copy out goes by the control channel, so rank 1 finishes the forwards before it
+first, and its data returns on the bulk connection. Data for rank 1 goes only
+between an acknowledged begin-restore and its validate. Rank 1's rows have no
+borrowable view, so they are always copied; rank 0's stay zero-copy. The bulk
+connection is TCP to `--tp-bootstrap-host`, so it runs at that route's rate:
+with the USB4 link carrying only RDMA (`tbv0` is a dummy interface), that is
+the LAN.
+
+Disk files hold both ranks' state, are written and read by rank 0 only, and
+carry a TP2 marker and both ranks' layouts in their identity, so a one-host
+server does not restore them.
+A restore validates on both ranks; a failure on either is a miss (the slot is
+reset on both and prefilled). A checkpoint from a request rank 1 rejected in
+this process is refused at validation by its `kProducer`.
 
 **Agreement.** Both ranks digest every call and its result; `kEnd` carries rank
 0's digest and call count, and rank 1 fails the request on a difference. Under
 greedy decoding rank 1 also checks its own argmax against every token rank 0
-advances. A capture carries the request's digest so far, and rank 1 captures
-only a state both ranks reached the same way. Snapshots and released states
-are reused at once, as on one host; a request that reuses what an unjudged
-request left fails too if rank 1 later rejects that request, and a rejected
-request's states and snapshots are not reused.
+advances. Checkpoints and released states are reused at once, as on one host;
+a request that reuses what an unjudged request left fails too if rank 1 later
+rejects that request, however long that request stays open, and a rejected
+request's states and checkpoints are not reused.
 
 ## Upstream integration, October 14, 2026
 
@@ -362,24 +372,38 @@ remain available. The routed oracle checks both widths, including ragged TP2
 output and input partitions, against unchanged numerical limits. Down
 projections address the separate 64-row map rather than the leading 48-row map.
 
-Single-host Flash-Next serving uses upstream's component cache. TP2 retains
-its coordinated rank snapshots and disk cache: component captures and their
-ownership transitions are not yet mirrored by the control protocol. In-pass
-checkpoints remain disabled in the TP wrapper. Deferred MoE residual fusion
-stays on the single-host path, where it cannot bypass a required rank sum.
+In-pass checkpoints remain disabled in the TP wrapper. Deferred MoE residual
+fusion stays on the single-host path, where it cannot bypass a required rank
+sum. The coordinated rank snapshots of that merge are gone; see
+[the November integration](#upstream-integration-november-7-2026).
 
 The configurable CQ spin budget is saved separately on
 `codex/wip-tp2-transport-experiments` and is not part of this merge; the DMA-BUF
 device windows are ([Design](#design)).
 
+## Upstream integration, November 7, 2026
+
+Upstream removed the generic continuation cache and every runner snapshot call,
+so TP2 moved onto the component cache ([Design](#design)). This retires
+`tp_disk_store`, rank 1's snapshot table, rank-specific disk files and the
+snapshot gate; captures no longer take the call mutex. Control protocol v21
+drops the snapshot and persist operations and adds begin restore, validate,
+reconcile and copy out, and the handshake no longer compares disk settings.
+`kMaxComponents` and `kMaxReferences` in `src/cache/disk.cpp` are raised for a
+pair's doubled components, the only change to the cache itself.
+
+Upstream's wide verification (`ForwardWide`) runs under TP2 with each rank's
+head widths. The prefill chunk returned to 4096 tokens upstream, so TP2 needs no
+chunk of its own.
+
 ## Tests and probes
 
 - `tp_control_test`, `tp_executor_test` (label `tp2`, in the CPU suite): the
   protocol, and the real scheduler and pool on rank 0 against an executor on
-  rank 1 with a toy model, for every request kind, divergence and reuse rule.
-- `tp_disk_store_test` (labels `tp2`, `disk`, in the CPU suite): rank 1's
-  disk cache on its own: restart, rejected writes, foreign or corrupt files,
-  eviction by least-recent use and rewriting a key.
+  rank 1 with a toy model, for every request kind, divergence and reuse rule,
+  through the real component cache: captures and restores of both ranks' state
+  over the bulk connection, their failure on either rank, eviction, and a
+  restart from disk.
 - `qwen38_flash_next.tp_partition` and the attention, projection and routed
   operator tests: the split against the full kernels.
 - `qwen38_flash_next_tp_probe` (`gpu-tp2`): prompt, decode and logit
@@ -426,7 +450,7 @@ On both hosts, from one commit (record it and the binary hash):
    a long prefill runs beside decoders.
 6. Images: a request, its cached repeat, a follow-up and two images in one
    request match one host's answers.
-7. Disk cache (`--cache-disk` on both ranks): after both ranks restart,
+7. Disk cache (`--cache-disk` on rank 0): after both ranks restart,
    `tools/serving/check-continuation.py --restore` restores its greedy cases
    from disk with the same outputs.
 8. Killing rank 1 mid-request returns 500 promptly, and rank 0 then exits
@@ -470,26 +494,6 @@ On both hosts, from one commit (record it and the binary hash):
    exact on both. The decode/prefill difference is a property of the shared
    kernels, not of the split; TP2 changes its direction here and tips a
    close choice.
-9. **Checkpoint records under TP2**: rank 0 retains snapshots in the
-   generic continuation cache, whose 128 records bind long before its byte
-   budget (13 of 34 GB in a full functional run); one host retains Flash-Next
-   in its component cache, which has no record limit. Upstream's record rule
-   keeps every conversation's last copy and lets a new copy evict only its own
-   conversation's earlier boundaries or redundant copies, so after about 128
-   conversations retry copies were skipped (`event=snapshot action=skipped
-   reason=entry_capacity`, 1,092 times) and edits lost their earlier
-   boundaries: `cache-edits`, `sampling-defaults` and `image-count` failed
-   late in a long run and passed on a fresh server. `TpMirroredRunner` now
-   enables `ContinuationCache::set_optional_copies_displace_idle`: under
-   record pressure a new copy first replaces the least recently used copy of
-   another conversation (never a branch point, its source or its own
-   conversation), as a byte-bounded cache would. The full Q4 MTP functional
-   run then passes everything except `tool-reasoning` and
-   `tool-native-schemas` (items above), with no record skips. Mirroring the
-   component cache itself on rank 1 would remove the record limit, but needs
-   every row copy, borrow, preservation copy, backing growth and disk write
-   replayed on rank 1.
-
 ## ROCm 10.1 upstream integration
 
 The integration through upstream `eb1d52e6` (#894) uses the pinned ROCm 10.1 toolchain.
@@ -526,15 +530,8 @@ dropped with upstream's rewrite of that kernel. Only the expert-local
 combine of a decode batch (`MoePart`) joins the next HC mixer's single launch
 (#894) under TP2; the combine after the all-reduce keeps its own launch.
 
-With `--cache-ram-bytes off`, rank 0's generic continuation cache keeps live
-states only. A commit then records the state's actual frontier (prompt plus
-reply); recording the prompt snapshot's tokens instead let a later prompt that
-shares only the earlier prompt reuse a state that had moved past it
-("reused prefix does not match checkpoint").
-
 The TP wrapper forwards rendered prompts for the shared template/token-count
 APIs. Request `cache_persist=false` reaches the scheduler on TP2 as well as on
-one host, so rank 0 does not initiate persistence of either rank's snapshot.
-The component-cache migration remains separate from this integration.
-Linux-only TP control and disk sources are excluded from Windows builds;
+one host, so rank 0 does not persist that checkpoint.
+Linux-only TP control sources are excluded from Windows builds;
 this does not add a Windows RDMA backend.

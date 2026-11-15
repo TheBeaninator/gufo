@@ -15,11 +15,14 @@
   openssl,
   ffmpeg-headless,
   ccache,
+  rustToolchain,
+  rustPlatform,
   rocmPackages,
   rdma-core ? null,
   enableTp2Rdma ? false,
   releaseVersion ? null,
   extensionsFromLock ? false,
+  extensions ? [ ],
   revision,
   sourceRoot ? ../..,
 }:
@@ -31,6 +34,10 @@ let
   rocmRuntime = rocmPackages.rocm-runtime.overrideAttrs (old: {
     patches = (old.patches or [ ]) ++ [ ./patches/rocr-fixed-cwsr-rocm10.patch ];
   });
+  cargoSetup = import ./png-decode-cargo.nix {
+    inherit lib rustPlatform;
+    lockFile = sourceRoot + "/src/core/png_decode/Cargo.lock";
+  };
   versionLabel = if releaseVersion == null then "development" else releaseVersion;
   packageVersion =
     if releaseVersion == null then "0-unstable-${revision}" else releaseVersion;
@@ -53,7 +60,7 @@ let
         relativePath = lib.removePrefix "${root}/" pathString;
       in
       pathString == root
-      || builtins.elem relativePath [ "CMakeLists.txt" "LICENSE" "NOTICE" "THIRD_PARTY_NOTICES.md" "extensions.lock" ]
+      || builtins.elem relativePath [ "CMakeLists.txt" "LICENSE" "NOTICE" "THIRD_PARTY_NOTICES.md" "extensions.lock" "rust-toolchain.toml" ]
       || relativePath == "licenses"
       || lib.hasPrefix "licenses/" relativePath
       || relativePath == "cmake"
@@ -93,6 +100,7 @@ stdenv.mkDerivation {
     ninja
     pkg-config
     makeWrapper
+    rustToolchain
     rocmPackages.clr
   ];
 
@@ -124,13 +132,14 @@ stdenv.mkDerivation {
     "-DGUFO_FFMPEG_EXECUTABLE=${ffmpeg-headless}/bin/ffmpeg"
     "-DGUFO_FFPROBE_EXECUTABLE=${ffmpeg-headless}/bin/ffprobe"
     "-DCMAKE_HIP_COMPILER=${rocmPackages.llvm.clang}/bin/clang"
-  ] ++ lib.optionals enableTp2Rdma [ "-DGUFO_ENABLE_TP2_RDMA=ON" ];
+  ] ++ lib.optionals enableTp2Rdma [ "-DGUFO_ENABLE_TP2_RDMA=ON" ]
+    ++ lib.optional (extensions != [ ]) "-DGUFO_EXTENSION_DIRS=${lib.concatMapStringsSep ";" (ext: "${ext}") extensions}";
 
   # CI exposes a persistent /tmp/gufo-ccache through extra-sandbox-paths for
   # C/C++ sources. Keep HIP uncached: Clang emits a bundled preprocessor output
   # whose included headers ccache 4.13.6 does not record. A header-only change
   # can then reuse a stale HIP object, including one from the timing baseline.
-  preConfigure = ''
+  preConfigure = cargoSetup + ''
     ccache_dir=/tmp/gufo-ccache
     if [[ -d "$ccache_dir" && -w "$ccache_dir" ]]; then
       export CCACHE_DIR="$ccache_dir"
@@ -181,6 +190,9 @@ stdenv.mkDerivation {
 
   passthru = {
     inherit releaseVersion revision rocmPackages rocmRuntime extensionsFromLock;
+    extensionMetadata = import ./extension-metadata.nix {
+      inherit lib sourceRoot extensions extensionsFromLock;
+    };
     toolchain = {
       targetPlatform = "x86_64-linux";
       targetGpu = "gfx1151";
