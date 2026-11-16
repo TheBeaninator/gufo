@@ -203,6 +203,9 @@ struct DeviceModelTestAccess {
     std::unique_ptr<DeviceModel> m(new DeviceModel());
     DeviceModelTestAccess b{*m, 0x5EED};
     m->config_ = c;
+    // One host: every trunk layer and the draft block compute all heads.
+    const MixerHeads all = MixerHeads::All(c);
+    m->trunk_heads_ = all;
     m->token_embd_ = b.Q8(c.vocab_size, c.hidden_size, 1, 0.05F);
     m->output_ = b.Q8(c.vocab_size, c.hidden_size);
     m->output_bytes_ = std::size_t{c.vocab_size} * (c.hidden_size / 32 * 34);
@@ -210,6 +213,7 @@ struct DeviceModelTestAccess {
     for (std::uint32_t il = 0; il < c.num_layers; ++il) {
       DeviceLayer l;
       l.linear = c.IsLinearLayer(il);
+      l.heads = all;
       l.hc_attn = b.Mixer(c, true, false);
       l.hc_ffn = b.Mixer(c, true, false);
       if (l.linear) {
@@ -237,6 +241,7 @@ struct DeviceModelTestAccess {
       m->layers_.push_back(l);
     }
     DeviceLayer& mtp = m->mtp_;
+    mtp.heads = all;
     mtp.hc_attn = b.Mixer(c, true, true);
     mtp.hc_ffn = b.Mixer(c, true, true);
     b.Attention(c, mtp);
