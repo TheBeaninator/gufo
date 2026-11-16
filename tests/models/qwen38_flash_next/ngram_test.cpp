@@ -16,8 +16,8 @@
 #include <vector>
 
 #include "src/core/platform/fs.hpp"
-#include "src/models/qwen38_flash_next/ngram_remainder.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
+#include "src/models/qwen38_flash_next/ngram_remainder.hpp"
 #include "tests/support/temporary_directory.hpp"
 
 namespace q = gufo::models::qwen38_flash_next;
