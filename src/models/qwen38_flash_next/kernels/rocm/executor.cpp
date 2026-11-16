@@ -1366,6 +1366,11 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
 
 bool Executor::CalibrateDecodeOverlap(std::string* error_msg) {
   decode_overlap_ = false;
+  // A TP rank's MoE ends in a sum with the peer, which needs a bound
+  // operation scope, and each rank would time its own layout. TP2 keeps the
+  // serial decode dispatch it was qualified with.
+  if (options_.all_reduce)
+    return true;
   const auto& layers = model_->layers();
   // Only Q8_0 shared experts overlap (see Moe).
   if (std::none_of(layers.begin(), layers.end(), [](const DeviceLayer& l) {
