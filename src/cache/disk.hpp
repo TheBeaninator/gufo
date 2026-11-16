@@ -284,6 +284,11 @@ public:
   // delivered by WaitForReclamation(); destruction joins the worker.
   void ReclaimOrphans();
   void WaitForReclamation();
+  // Optional. Runs after each chunk or private file is unlinked, by any path
+  // (retirement, reclamation), under the store's locks: it must be quick and
+  // must not call back into the store. Set before ReclaimOrphans.
+  void SetRemovalObserver(
+      std::function<void(bool private_file, DiskFileId)> observer);
 #ifdef GUFO_CACHE_TESTING
   void SetCrashHook(std::function<void(DiskPublicationStep)>);
   // Current-thread scope around reference validation, after filesystem

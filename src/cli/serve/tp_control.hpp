@@ -75,8 +75,8 @@ enum class TpInstructionOp : std::uint8_t {
   /// the model state to the request's prompt context (its images, if any), as
   /// the pool does whenever it leases a state; with sequence 0 it clears it.
   kPromptContext = 12,
-  /// Rank 0's cache starts restoring `positions` into the state's slot; rows
-  /// and private state follow on the bulk connection. Acknowledged, like every
+  /// Rank 0's cache starts restoring `positions` into the state's slot; loads
+  /// of rank 1's stored rows and private state follow. Acknowledged, like every
   /// call that changes what the cache may do next. The cache ops below belong
   /// to no request: it runs them while it assigns slots, and sends sequence 0.
   kBeginRestore = 16,
@@ -85,10 +85,19 @@ enum class TpInstructionOp : std::uint8_t {
   kValidate = 17,
   /// `ReconcileComponentState(state, first)`.
   kReconcile = 18,
-  /// Send rank 1's rows [first, end) of `component`, or its private state's
-  /// bytes [first, end) with `is_private`, as bulk transfer `transfer`. The
-  /// control channel orders this after the calls that produced them.
-  kCopyOut = 19,
+  /// Copy rank 1's rows [first, end) of `component`, or with `is_private` its
+  /// whole private state, into rank 1's own store under `key`. Rank 0's cache
+  /// keeps only the key, so rank 1's half of a checkpoint never crosses the
+  /// link. Unanswered: the control channel orders it after the calls that
+  /// produced the rows and before the next, and a failed stash leaves the key
+  /// missing, so a later load of it fails.
+  kStash = 19,
+  /// Load the stored entry `key`, from its row `key_first` on, into rows
+  /// [first, end) of `component` of the state's slot, or with `is_private`
+  /// its whole private state. Rank 0 sends these only between an acknowledged
+  /// kBeginRestore and kValidate, unanswered: a failed load makes that
+  /// kValidate refuse the restore.
+  kLoadStashed = 20,
   /// `DecodeBatch` over `batch`: one multi-token cycle for every member, with
   /// the batch's draft count from `batch_drafts` (the plan rank 0 chose, plus
   /// one; zero lets each member use its own `drafts`). Sent with
@@ -130,13 +139,16 @@ struct TpInstruction {
   /// none) before the call.
   std::uint64_t rng{0};
   std::int32_t pending{-1};
-  /// kCopyOut only.
-  std::uint64_t transfer{0};
+  /// kStash and kLoadStashed only.
   std::uint32_t component{0};
   std::uint32_t is_private{0};
-  /// kCopyOut and kReconcile only.
+  /// kStash, kLoadStashed and kReconcile only.
   std::uint64_t first{0};
   std::uint64_t end{0};
+  /// kStash and kLoadStashed only: the stored entry, and for a load the entry
+  /// row that lands on `first`.
+  std::uint64_t key{0};
+  std::uint64_t key_first{0};
   /// kBeginRestore and kValidate only: rank 1's component positions, as
   /// (component, valid rows).
   std::vector<std::pair<std::uint32_t, std::uint64_t>> positions;

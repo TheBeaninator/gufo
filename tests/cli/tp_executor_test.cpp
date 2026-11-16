@@ -571,7 +571,8 @@ void ToyState::SetCancellationCheck(const CancellationCheck&) {
 /// between them. Both ranks hold `sessions` states.
 class Pair {
 public:
-  /// With `disk`, rank 0's cache persists there, for both ranks' state.
+  /// With `disk`, rank 0's cache persists there, and rank 1's store keeps its
+  /// halves under `disk`/rank1.
   Pair(ToyOptions rank0_options, ToyOptions rank1_options,
        std::size_t sessions = 1, std::filesystem::path disk = {})
       : inner0_(std::make_shared<ToyRunner>(rank0_options)),
@@ -611,7 +612,12 @@ public:
     Require(TpBulkSocket::Pair(&bulk0, &bulk1, &bulk_error), bulk_error);
     // Rank 1 says hello on the bulk connection, which the mirrored runner
     // reads.
-    executor_ = std::make_unique<TpExecutor>(runner1_, sessions, bulk1);
+    gufo::server::TpPeerStoreOptions store;
+    if (!disk.empty()) {
+      store.disk_directory = disk / "rank1";
+    }
+    executor_ = std::make_unique<TpExecutor>(runner1_, sessions, bulk1, nullptr,
+                                             std::move(store));
     mirrored_ = std::make_shared<TpMirroredRunner>(inner0_, sink_, bulk0);
     std::optional<gufo::server::TextRunnerDiskCacheOptions> disk_options;
     if (!disk.empty()) {
@@ -631,12 +637,19 @@ public:
     server_.reset();
     client_->Interrupt();
     worker_.join();
+    // As in serving, rank 0 goes first, so rank 1 applies its releases.
+    sink_.reset();
+    mirrored_.reset();
+    executor_.reset();
   }
 
   struct Outcome {
     TextGenerationBackend::Result result;
     std::string worker_error;
   };
+  [[nodiscard]] gufo::server::TpPeerStore::Stats PeerStore() const {
+    return executor_->PeerStoreStats();
+  }
 
   /// A request that finished on rank 0 but has not ended on rank 1 yet.
   struct Open {
@@ -1011,9 +1024,9 @@ void TestBulkSocket() {
     Require(TpBulkSocket::Pair(&a, &b, &error), error);
     const std::array<std::byte, 3> payload{std::byte{1}, std::byte{2},
                                            std::byte{3}};
-    Require(!a->Send({.kind = TpBulkKind::kOut, .bytes = 2}, payload, &error),
+    Require(!a->Send({.kind = TpBulkKind::kHello, .bytes = 2}, payload, &error),
             "a frame's size must match its payload");
-    Require(a->Send({.kind = TpBulkKind::kOut,
+    Require(a->Send({.kind = TpBulkKind::kHello,
                      .state = 1,
                      .component = 2,
                      .is_private = 1,
@@ -1028,7 +1041,7 @@ void TestBulkSocket() {
     Require(b->ReceiveHeader(&header, &error) &&
                 b->ReceivePayload(received, &error),
             error);
-    Require(header.kind == TpBulkKind::kOut && header.state == 1 &&
+    Require(header.kind == TpBulkKind::kHello && header.state == 1 &&
                 header.component == 2 && header.is_private == 1 &&
                 header.transfer == 3 && header.first == 4 && header.end == 5 &&
                 header.bytes == 3 && received == payload,
@@ -1128,6 +1141,8 @@ int main() {
     const auto sampling = mtp ? Sampled() : gufo::sampling::SamplingConfig{};
     const auto first = pair.Run(prompt, 6, sampling, {}, {}, true);
     Require(first.worker_error.empty(), "cached first: " + first.worker_error);
+    Require(pair.PeerStore().ram_entries > 0,
+            "rank 1 keeps its half of rank 0's checkpoints in its own store");
     const auto again = pair.Run(prompt, 6, sampling, {}, {}, true);
     Require(again.worker_error.empty(),
             "cached restore: " + again.worker_error);

@@ -462,7 +462,8 @@ target_link_libraries(gufo_serving PUBLIC gufo_ext_runtime gufo_logging
 # TP2 rank control: the executor serves a rank-0 runner from
 # inference_backend.cpp, which `GUFO_HAS_TP2_CONTROL` enables.
 if(NOT WIN32)
-  target_sources(gufo_serving PRIVATE src/cli/serve/tp_executor.cpp)
+  target_sources(gufo_serving PRIVATE src/cli/serve/tp_executor.cpp
+    src/cli/serve/tp_peer_store.cpp)
   target_link_libraries(gufo_serving PUBLIC gufo_tp_control)
   target_compile_definitions(gufo_serving PUBLIC GUFO_HAS_TP2_CONTROL=1)
 endif()
@@ -878,6 +879,11 @@ endfunction()
     COMMAND tp_instruction_latency_test)
   set_tests_properties(tp_instruction_latency_test PROPERTIES
     LABELS "cpu;tp2;perf" TIMEOUT 300)
+
+  add_executable(tp_peer_store_test tests/cli/tp_peer_store_test.cpp)
+  target_link_libraries(tp_peer_store_test PRIVATE gufo_serving)
+  add_test(NAME tp_peer_store_test COMMAND tp_peer_store_test)
+  set_tests_properties(tp_peer_store_test PROPERTIES LABELS "cpu;tp2" TIMEOUT 60)
 
   add_executable(tp_executor_test tests/cli/tp_executor_test.cpp)
   target_link_libraries(tp_executor_test PRIVATE gufo_cache_fake gufo_serving)

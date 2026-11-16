@@ -1,6 +1,7 @@
 #ifndef GUFO_SERVER_INFERENCE_BACKEND_HPP_
 #define GUFO_SERVER_INFERENCE_BACKEND_HPP_
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -115,6 +116,10 @@ public:
   void set_tp_config(TextTpConfig config);
   /// Runs the rank-1 TP2 worker loop until the control channel closes.
   [[nodiscard]] bool run_worker(std::string* error);
+  /// Rank 1 of a TP2 pair: waits up to `timeout` for its store's disk writes,
+  /// which rank 0's disk entries may refer to after a restart. True if none
+  /// are pending.
+  bool flush_tp_store(std::chrono::milliseconds timeout);
   /// Rank 0 of a TP2 pair: why the pair broke (rank 1 or the link was lost),
   /// or empty. Once it did, every later request fails and the server is not
   /// ready.

@@ -450,6 +450,8 @@ struct ComponentTextCache::Impl {
           resources->stream);
       disk_capacity = options->capacity_bytes;
       disk_step = options->min_checkpoint_step_tokens;
+      if (resources->disk_removed)
+        disk->SetRemovalObserver(resources->disk_removed);
       disk->ReclaimOrphans();
       if (disk->Stats().managed_bytes > disk_capacity) {
         // A lowered --cache-disk-bytes keeps its meaning: reclaim orphans and
@@ -473,6 +475,8 @@ struct ComponentTextCache::Impl {
               "cache",
               "schema=component-cache-v1 event=disk_over_budget" + fields);
       }
+      if (resources->disk_opened)
+        resources->disk_opened(*disk);
       queue = std::make_unique<cache::PersistenceQueue>(
           ledger, *streaming, kPersistenceDepth, ram,
           [this] {
@@ -481,6 +485,13 @@ struct ComponentTextCache::Impl {
                 entries, [](const auto& entry) { return entry->busy; });
           },
           [this](cache::CheckpointId id, bool success) {
+            // The job still holds its sources here.
+            if (success && resources->disk_published) {
+              try {
+                resources->disk_published(*disk, id);
+              } catch (...) {
+              }
+            }
             const std::lock_guard lock(mutex);
             const bool was_demoted = id == demotion_id;
             if (was_demoted)

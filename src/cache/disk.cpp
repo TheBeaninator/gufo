@@ -652,6 +652,8 @@ struct DiskStore::Impl {
       // Verification caching is optional; the completed read remains valid.
     }
   }
+  // Told of every chunk or private file unlinked; see SetRemovalObserver.
+  std::function<void(bool, DiskFileId)> removal_observer;
   void ForgetVerified(std::pair<bool, DiskFileId> key) {
     std::unique_lock guard(verification_mutex);
     auto node = verified.extract(key);
@@ -1027,6 +1029,14 @@ struct DiskStore::Impl {
       std::lock_guard guard(stats_mutex);
       stats.managed_bytes -= st.size;
     }
+    if (removal_observer &&
+        (&directory == &chunks || &directory == &private_files))
+      if (auto id = ParseName(name))
+        try {
+          removal_observer(&directory == &private_files, *id);
+        } catch (...) {
+          // Observation is advisory; the removal already happened.
+        }
     return true;
   }
   bool Referenced(const platform::Directory& directory, DiskFileId id) const {
@@ -2116,6 +2126,11 @@ void DiskStore::ReclaimOrphans() {
     std::lock_guard guard(state->mutex);
     state->Reclaim();
   });
+}
+void DiskStore::SetRemovalObserver(
+    std::function<void(bool private_file, DiskFileId)> observer) {
+  std::lock_guard guard(impl_->mutex);
+  impl_->removal_observer = std::move(observer);
 }
 void DiskStore::WaitForReclamation() {
   if (impl_->reclamation.valid())

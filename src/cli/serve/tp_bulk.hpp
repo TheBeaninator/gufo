@@ -14,15 +14,17 @@ namespace gufo::server {
 enum class TpBulkKind : std::uint32_t {
   /// Rank 1's component descriptors, once, when the connection opens.
   kHello = 1,
-  /// Rank 1's cache rows or private state, answering a control instruction.
-  kOut = 2,
-  /// Rows or private state for rank 1's slot. Rank 0 sends these only between
-  /// an acknowledged BeginRestore and its Validate.
-  kIn = 3,
-  /// Rank 1 settled a `kIn`.
-  kInDone = 4,
-  /// Rank 1 could not produce a `kOut` or settle a `kIn`. `bytes` is a message.
-  kFailed = 5,
+  /// Rank 0's cache dropped its RAM copy of stored entry `transfer` (the key);
+  /// rank 0 sends these, without a payload. (2 and 3 answered transfers before
+  /// protocol 24.)
+  kRelease = 4,
+  /// Rank 0 published one of its disk files: `is_private` and the payload's
+  /// 16-byte file id, then the 8-byte keys its references name.
+  kPublished = 5,
+  /// Rank 0 unlinked a disk file: `is_private` and the 16-byte file id.
+  kRemoved = 6,
+  /// Rank 0's disk files at its startup, 17 bytes each: id, then 1 if private.
+  kLive = 7,
 };
 
 struct TpBulkHeader {
@@ -39,11 +41,12 @@ struct TpBulkHeader {
 
 /// The second TCP connection of a TP2 pair, next to the control channel.
 ///
-/// Rank 0's single cache owns both ranks' retained state, so rank 1's half of
-/// every checkpoint crosses here. It is apart from the control channel so that
-/// a restore's gigabytes never delay the instructions of other requests.
-/// Connections prove the control token as the control channel does. One thread
-/// may send and another receive at once; sends are serialized.
+/// Rank 0's cache retains rank 1's half of each checkpoint only as keys into
+/// rank 1's own store; this connection carries the completions of stashes and
+/// loads, and rank 0's releases, which its cache issues from destructors and
+/// so cannot wait behind the control channel's instructions. Connections prove
+/// the control token as the control channel does. One thread may send and
+/// another receive at once; sends are serialized.
 class TpBulkSocket final {
 public:
   [[nodiscard]] static std::shared_ptr<TpBulkSocket> Listen(

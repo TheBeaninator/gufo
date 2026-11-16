@@ -19,6 +19,7 @@
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/cli/serve/tp_bulk.hpp"
 #include "src/cli/serve/tp_control.hpp"
+#include "src/cli/serve/tp_peer_store.hpp"
 
 namespace gufo::server {
 
@@ -129,9 +130,10 @@ struct TpRequestContext final : TextPromptContext {
 /// request whose state it runs on, and a batched call to all of its members.
 ///
 /// Rank 0's component cache owns both ranks' checkpoints: its adapter presents
-/// rank 1's state as further components, whose bytes cross the bulk connection
-/// (`PairAdapter`). Cache operations that change a slot are acknowledged before
-/// the next forward on it. It never
+/// rank 1's state as further components holding references into rank 1's own
+/// store (`PairAdapter`, `TpPeerStore`), so rank 1's half stays on rank 1.
+/// Cache operations that change a slot are acknowledged before the next
+/// forward on it. It never
 /// forwards a request's cancellation check to the model session: a session
 /// aborting between layers would strand rank 1 inside an exchange, so
 /// cancellation acts only between calls, where the scheduler already checks.
@@ -145,7 +147,8 @@ class TpMirroredRunner final
       public std::enable_shared_from_this<TpMirroredRunner> {
 public:
   /// Reads rank 1's cache components from `bulk`, so rank 1's `TpExecutor`
-  /// must be coming up meanwhile.
+  /// must be coming up meanwhile. Rank 1's halves of checkpoints stay in rank
+  /// 1's store; `bulk` carries their completions and releases.
   TpMirroredRunner(std::shared_ptr<TextModelRunner> inner,
                    std::shared_ptr<TpInstructionSink> sink,
                    std::shared_ptr<TpBulkSocket> bulk,
@@ -257,6 +260,7 @@ private:
   class Bulk;
   class PairSlot;
   class PairAdapter;
+  class DiskMirror;
   /// An open request's share of the instruction stream.
   struct Request {
     std::uint64_t count{0};
@@ -338,17 +342,28 @@ private:
 
 /// Rank 1's side of a TP2 pair: executes rank 0's instructions on its own
 /// states, which it creates up front in the same number and order as rank 0's
-/// pool, so a state id names corresponding states on both ranks.
+/// pool, so a state id names corresponding states on both ranks. It keeps its
+/// half of rank 0's checkpoints in a `TpPeerStore` under rank 0's keys.
 class TpExecutor {
 public:
-  /// Sends rank 1's cache components over `bulk`, then allocates the states.
+  /// Sends rank 1's cache components over `bulk`, then allocates the states
+  /// and the store's backing (`store.ram_bytes` of pinned host memory).
   TpExecutor(std::shared_ptr<TextModelRunner> runner, std::size_t state_count,
              std::shared_ptr<TpBulkSocket> bulk,
-             std::shared_ptr<TpCallScope> scope = {});
+             std::shared_ptr<TpCallScope> scope = {},
+             TpPeerStoreOptions store = {});
   ~TpExecutor();
 
   using Respond = std::function<bool(const TpControlResponse&, std::string*)>;
   [[nodiscard]] std::size_t open_requests() const { return requests_.size(); }
+  /// Rank 1's half of rank 0's checkpoints.
+  [[nodiscard]] TpPeerStore::Stats PeerStoreStats() const {
+    return store_->Snapshot();
+  }
+  /// See `TpPeerStore::Flush`.
+  bool FlushPeerStore(std::chrono::milliseconds timeout) {
+    return store_->Flush(timeout);
+  }
 
   /// Executes one command from rank 0: `kSingle` opens a request, and an
   /// instruction makes a model call for the request it names, for the members
@@ -379,7 +394,13 @@ private:
                                     const Respond& respond, std::string* error);
   [[nodiscard]] bool ExecuteBatch(const TpInstruction& instruction,
                                   std::string* error);
-  [[nodiscard]] std::size_t RowBytes(cache::ComponentId id) const;
+  /// Runs a kStash or kLoadStashed on this thread, so the channel orders it
+  /// between the slot's calls; throws when it fails.
+  void RunStored(const TpInstruction& instruction);
+  /// Host memory for a load read back from disk.
+  [[nodiscard]] std::span<std::byte> Staging(std::size_t bytes);
+  [[nodiscard]] const cache::ComponentDescriptor& Descriptor(
+      cache::ComponentId id) const;
   [[nodiscard]] bool TakeIndex(const TpControlCommand& command,
                                std::string* error);
   [[nodiscard]] TextRunnerState& StateFor(std::uint32_t id);
@@ -400,7 +421,14 @@ private:
   std::vector<std::unique_ptr<TextRunnerState>> states_;
   std::unordered_map<std::uint64_t, std::unique_ptr<Request>> requests_;
   std::uint64_t next_index_{0};
-  /// Last: its threads use the slots above.
+  /// Holds payloads from `resources_`' pool.
+  std::unique_ptr<TpPeerStore> store_;
+  /// Slots whose restore lost a load since its kBeginRestore: its kValidate
+  /// refuses.
+  std::unordered_set<std::uint32_t> failed_restores_;
+  std::shared_ptr<void> staging_owner_;
+  std::span<std::byte> staging_;
+  /// Last: its thread uses the store above.
   std::unique_ptr<Bulk> bulk_;
 };
 

@@ -171,11 +171,11 @@ the MTP draft policy on its one-session costs; see gufo-org/gufo#258). Check
 Chat and raw completions (including `ignore_eos`), sampling, streaming, stop
 sequences, tool calls, images (`--mmproj` on both ranks), cancellation,
 `--request-timeout-ms`, history reuse and the disk cache work as on one host.
-Rank 0 owns the whole cache, so `--cache-ram-bytes`, `--cache-disk` and
-`--cache-disk-bytes` belong on rank 0 and rank 1 ignores them. Its RAM and disk
-hold both ranks' state, so the same limit retains about half the conversations
-of one host. The pair also opens a bulk TCP connection on the control port plus
-one, from rank 1 to `--tp-bootstrap-host`, so a firewall must allow both ports.
+Rank 0's cache decides what is kept; each rank holds its own half of every
+checkpoint, so give both ranks the same `--cache-ram-bytes`, `--cache-disk` and
+`--cache-disk-bytes` (rank 1 keeps its half under `--cache-disk`/`tp2-peer`).
+The pair also opens a bulk TCP connection on the control port plus one, from
+rank 1 to `--tp-bootstrap-host`, so a firewall must allow both ports.
 Cancellations and timeouts take effect between model calls, so a long prefill
 stops at its next chunk. Up to `--sessions` requests run at once, their
 decoders batched; more wait up to `--max-pending`, the rest get HTTP 429.
@@ -324,27 +324,58 @@ pass through the wrapper; a request's cancellation check is never passed to the
 model session, which could strand rank 1 inside an exchange; TP2 must not
 change the cache's boundaries.
 
-**Cache.** Rank 0 runs the ordinary component cache, unpatched, over
+**Cache.** Rank 0 runs the ordinary component cache, using only its optional
+disk-tier hooks (below), over
 `TpMirroredRunner::PairAdapter`. The adapter's components are rank 0's, then
 rank 1's under ids offset by `kPeerBase`, then one private `kProducer` holding
 the process nonce and the request that produced the state. Everything above it
 (retention, eviction, branch points, the disk store) therefore sees one model
-with twice the components, and a checkpoint holds both ranks' bytes or neither.
-Rank 1 keeps its slots and states but retains nothing.
+with twice the components, and a checkpoint holds both halves or neither.
 
-Rank 1's bytes cross `TpBulkSocket`, a second TCP connection proving the control
-token, so a restore's gigabytes never delay another request's instructions. A
-copy out goes by the control channel, so rank 1 finishes the forwards before it
-first, and its data returns on the bulk connection. Data for rank 1 goes only
-between an acknowledged begin-restore and its validate. Rank 1's rows have no
-borrowable view, so they are always copied; rank 0's stay zero-copy. The bulk
-connection is TCP to `--tp-bootstrap-host`, so it runs at that route's rate:
-with the USB4 link carrying only RDMA (`tbv0` is a dummy interface), that is
-the LAN.
+Rank 1's components hold references, not bytes: 16 bytes per row (and per
+private state) naming an entry of rank 1's `TpPeerStore`. A capture sends
+`kStash` by the control channel, after the forwards that produced the rows;
+rank 1 copies its rows into pinned backing from its own model pool under rank
+0's random key. A restore sends `kLoadStashed` for each run of rows of one
+entry, only between an acknowledged begin-restore and its validate. Rank 1 runs
+both inline, in channel order, and neither is answered: rank 0's cache keeps up
+to 16 transfers in flight, and a reply for each cost a LAN round trip per 16
+(about 0.27 s for an 18.5K restore). A failed stash leaves its key missing; a
+failed load makes the restore's validate refuse. When rank 0's cache drops a
+reference payload, its owner sends `kRelease` on `TpBulkSocket`, a second TCP
+connection proving the control token, which also carries rank 1's descriptors
+when the pair connects. A release frees rank 1's RAM copy; one that overtakes
+its stash applies once the stash arrives.
 
-Disk files hold both ranks' state, are written and read by rank 0 only, and
-carry a TP2 marker and both ranks' layouts in their identity, so a one-host
-server does not restore them.
+Rank 1's disk tier (under `--cache-disk`/`tp2-peer`) mirrors rank 0's. Rank 0's
+cache writes rank 1's references into its own disk files, so rank 0 tells rank
+1 which files hold which keys, through three optional hooks the component cache
+offers (`ComponentCacheResources::disk_opened`, `disk_published`,
+`disk_removed`, the last one the disk store's removal observer). Once a
+checkpoint is durable, and before its payloads are released, rank 0 reads the
+references in each newly written rank-1 file back and sends `kPublished` with
+the file id and its keys; when the store unlinks one, by retirement or
+reclamation, it sends `kRemoved`; at startup it sends `kLive`, the files it
+still has. Rank 1 writes a half to disk once a published file names it and
+deletes it once none does, so it needs no eviction policy of its own: rank 0's
+`--cache-disk-bytes` bounds both. Its file-to-key index (`files.idx`, checksummed
+records) survives restarts. When rank 1 loses rank 0 it waits up to 5 s for
+queued writes before exiting. Under pool pressure rank 1 frees the RAM copies
+of written entries first, then spills its least recently used live entries to
+disk. A load of an entry rank 1 no longer holds fails its validation, and rank
+0's cache drops that checkpoint (RAM) or disk file and computes the state
+again.
+
+Only keys, releases and file notices cross the network, so the bulk connection's rate (the
+LAN route to `--tp-bootstrap-host`; `tbv0` is a dummy interface) no longer
+bounds captures and restores. Before this, rank 1's half crossed it in full:
+on Q4 over 2.5 Gbit/s Ethernet that added 0.6 s to a 1K prompt's TTFT, 3.0 s
+to a 32K prompt's, and made an 18.5K RAM restore 3.4 times slower than rank 1
+keeping its own half.
+
+Rank 0's disk files hold rank 0's half and rank 1's references, and carry a TP2
+marker and both ranks' layouts in their identity, so a one-host server does not
+restore them; rank 1's disk entries carry a CRC-64 checked before a load.
 A restore validates on both ranks; a failure on either is a miss (the slot is
 reset on both and prefilled). A checkpoint from a request rank 1 rejected in
 this process is refused at validation by its `kProducer`.
@@ -402,8 +433,11 @@ chunk of its own.
   protocol, and the real scheduler and pool on rank 0 against an executor on
   rank 1 with a toy model, for every request kind, divergence and reuse rule,
   through the real component cache: captures and restores of both ranks' state
-  over the bulk connection, their failure on either rank, eviction, and a
+  through rank 1's store, their failure on either rank, eviction, and a
   restart from disk.
+- `tp_peer_store_test` (label `tp2`, in the CPU suite): rank 1's store: loads
+  in part, release with and without a disk tier, recovery, a corrupt disk
+  entry, and eviction under pool and disk pressure.
 - `qwen38_flash_next.tp_partition` and the attention, projection and routed
   operator tests: the split against the full kernels.
 - `qwen38_flash_next_tp_probe` (`gpu-tp2`): prompt, decode and logit
@@ -450,7 +484,7 @@ On both hosts, from one commit (record it and the binary hash):
    a long prefill runs beside decoders.
 6. Images: a request, its cached repeat, a follow-up and two images in one
    request match one host's answers.
-7. Disk cache (`--cache-disk` on rank 0): after both ranks restart,
+7. Disk cache (`--cache-disk` on both ranks): after both ranks restart,
    `tools/serving/check-continuation.py --restore` restores its greedy cases
    from disk with the same outputs.
 8. Killing rank 1 mid-request returns 500 promptly, and rank 0 then exits

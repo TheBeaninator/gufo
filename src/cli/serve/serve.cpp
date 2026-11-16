@@ -2071,6 +2071,11 @@ int RunServe(std::span<const char* const> args) {
         // exchange the peer never ends.
         server::Logger::Error("server",
                               "event=tp_worker_failed reason=" + worker_error);
+        // Rank 0's disk entries may refer to halves still being written; the
+        // writes touch only local files, so they cannot hang on the peer.
+        if (!backend->flush_tp_store(std::chrono::seconds(5))) {
+          server::Logger::Warn("tp", "event=tp_peer_store_flush_incomplete");
+        }
         std::cerr.flush();
         std::fflush(nullptr);
         std::_Exit(1);

@@ -595,13 +595,29 @@ bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner> runner,
     }
     if (tp_world_size > 1 && tp_rank != 0) {
       // Rank 1 serves nothing itself: it executes rank 0's model calls on as
-      // many slots as rank 0's cache creates, and keeps no cache of its own.
+      // many slots as rank 0's cache creates, and stores its half of the
+      // checkpoints that cache retains.
       Logger::Info("loader",
                    "event=load_phase phase=sessions " + Logger::MemoryStatus());
       auto scope = std::make_shared<RunnerCallScope>(runner);
-      new_state->tp_executor =
-          std::make_shared<TpExecutor>(std::move(runner), session_count,
-                                       std::move(tp_bulk), std::move(scope));
+      // Rank 1 keeps its half of rank 0's checkpoints under its own cache
+      // budgets, sized as rank 0 sizes its cache.
+      TpPeerStoreOptions store;
+      if (!ram_cache_config.enabled) {
+        store.ram_bytes = std::size_t{512} << 20;  // disk captures only
+      } else if (ram_cache_config.capacity_bytes == 0) {
+        store.ram_bytes = TextRunnerRamCacheOptions::kAutomaticMaxBytes;
+        store.automatic_ram = true;
+      } else {
+        store.ram_bytes = ram_cache_config.capacity_bytes;
+      }
+      // Its disk tier mirrors rank 0's, so rank 0's budget bounds it.
+      if (DiskCacheEnabled(disk_cache_config)) {
+        store.disk_directory = disk_cache_config.directory;
+      }
+      new_state->tp_executor = std::make_shared<TpExecutor>(
+          std::move(runner), session_count, std::move(tp_bulk),
+          std::move(scope), std::move(store));
       {
         const std::lock_guard<std::mutex> lock(impl_->state_mutex);
         impl_->state = std::move(new_state);
@@ -775,6 +791,17 @@ bool InferenceBackend::run_worker(std::string* error) {
   return false;
 #endif
 }
+bool InferenceBackend::flush_tp_store(std::chrono::milliseconds timeout) {
+#if defined(ENGINE_ENABLE_HIP) && defined(GUFO_HAS_TP2_CONTROL)
+  const auto state = impl_->Snapshot();
+  return state == nullptr || state->tp_executor == nullptr ||
+         state->tp_executor->FlushPeerStore(timeout);
+#else
+  (void)timeout;
+  return true;
+#endif
+}
+
 std::string InferenceBackend::tp_failure() const {
 #if defined(ENGINE_ENABLE_HIP) && defined(GUFO_HAS_TP2_CONTROL)
   const auto state = impl_->Snapshot();

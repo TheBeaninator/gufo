@@ -354,14 +354,24 @@ int main() {
                                 .first = 2048}});
     round_trip({.sequence = sequence,
                 .kind = TpControlCommandKind::kInstruction,
-                .instruction = {.op = TpInstructionOp::kCopyOut,
+                .instruction = {.op = TpInstructionOp::kStash,
                                 .index = 15,
                                 .state = 3,
-                                .transfer = 0xfedcba9876543210ULL,
                                 .component = 2,
                                 .is_private = 1,
                                 .first = 16,
-                                .end = 32}});
+                                .end = 32,
+                                .key = 0x0123456789abcdefULL}});
+    round_trip({.sequence = sequence,
+                .kind = TpControlCommandKind::kInstruction,
+                .instruction = {.op = TpInstructionOp::kLoadStashed,
+                                .index = 16,
+                                .state = 2,
+                                .component = 3,
+                                .first = 256,
+                                .end = 384,
+                                .key = 0x0123456789abcdefULL,
+                                .key_first = 64}});
   }
   round_trip(
       {.sequence = command.sequence,
@@ -484,24 +494,27 @@ int main() {
   refuses("a one-token decode", with([](auto& bad) {
             bad.instruction = {.op = TpInstructionOp::kDecode, .count = 1};
           }));
-  refuses("a copy without a transfer", with([](auto& bad) {
-            bad.instruction = {
-                .op = TpInstructionOp::kCopyOut, .first = 0, .end = 4};
+  refuses("a stash without a key", with([](auto& bad) {
+            bad.instruction = {.op = TpInstructionOp::kStash, .end = 4};
           }));
-  refuses("a transfer outside a copy",
-          with([](auto& bad) { bad.instruction.transfer = 1; }));
-  refuses("an empty copy", with([](auto& bad) {
-            bad.instruction = {.op = TpInstructionOp::kCopyOut,
-                               .transfer = 1,
+  refuses("a key outside a stash",
+          with([](auto& bad) { bad.instruction.key = 1; }));
+  refuses(
+      "an entry row outside a load", with([](auto& bad) {
+        bad.instruction = {
+            .op = TpInstructionOp::kStash, .end = 4, .key = 1, .key_first = 2};
+      }));
+  refuses("an empty load", with([](auto& bad) {
+            bad.instruction = {.op = TpInstructionOp::kLoadStashed,
                                .first = 4,
-                               .end = 4};
+                               .end = 4,
+                               .key = 1};
           }));
-  refuses("an unknown copy kind", with([](auto& bad) {
-            bad.instruction = {.op = TpInstructionOp::kCopyOut,
-                               .transfer = 1,
-                               .is_private = 2,
-                               .end = 4};
-          }));
+  refuses(
+      "an unknown stash kind", with([](auto& bad) {
+        bad.instruction = {
+            .op = TpInstructionOp::kStash, .is_private = 2, .end = 4, .key = 1};
+      }));
   refuses("a component outside a copy",
           with([](auto& bad) { bad.instruction.component = 1; }));
   refuses("a row range outside a copy",

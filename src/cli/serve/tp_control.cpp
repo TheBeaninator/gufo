@@ -32,7 +32,7 @@ namespace gufo::server {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x54504331U;  // "TPC1"
-constexpr std::uint16_t kVersion = 22;         // includes logprobs settings
+constexpr std::uint16_t kVersion = 24;  // stashes and loads go unanswered
 constexpr std::uint16_t kHello = 1;
 constexpr std::uint16_t kCommand = 2;
 constexpr std::uint16_t kResponse = 3;
@@ -237,12 +237,18 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
     SetError(error, "TP instruction carries a draft count it does not use");
     return false;
   }
-  const bool copy_op = instruction.op == TpInstructionOp::kCopyOut;
-  if (copy_op != (instruction.transfer != 0) ||
-      (!copy_op &&
+  const bool stash_op = instruction.op == TpInstructionOp::kStash ||
+                        instruction.op == TpInstructionOp::kLoadStashed;
+  if (stash_op != (instruction.key != 0) ||
+      (instruction.op != TpInstructionOp::kLoadStashed &&
+       instruction.key_first != 0)) {
+    SetError(error, "TP instruction stash arguments are invalid");
+    return false;
+  }
+  if ((!stash_op &&
        (instruction.component != 0 || instruction.is_private != 0)) ||
-      (copy_op && instruction.is_private > 1) ||
-      (!copy_op && instruction.op != TpInstructionOp::kReconcile &&
+      (stash_op && instruction.is_private > 1) ||
+      (!stash_op && instruction.op != TpInstructionOp::kReconcile &&
        (instruction.first != 0 || instruction.end != 0))) {
     SetError(error, "TP instruction transfer arguments are invalid");
     return false;
@@ -309,7 +315,8 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
     case TpInstructionOp::kReconcile:
       valid = only(false, false, false, false, false);
       break;
-    case TpInstructionOp::kCopyOut:
+    case TpInstructionOp::kStash:
+    case TpInstructionOp::kLoadStashed:
       valid = only(false, false, false, false, false) &&
               instruction.end > instruction.first;
       break;
@@ -345,7 +352,8 @@ bool ReadU64(std::span<const std::uint8_t> data, std::size_t* offset,
       instruction.op != TpInstructionOp::kBeginRestore &&
       instruction.op != TpInstructionOp::kValidate &&
       instruction.op != TpInstructionOp::kReconcile &&
-      instruction.op != TpInstructionOp::kCopyOut &&
+      instruction.op != TpInstructionOp::kStash &&
+      instruction.op != TpInstructionOp::kLoadStashed &&
       instruction.op != TpInstructionOp::kPromptContext &&
       instruction.op != TpInstructionOp::kAdvanceBatch &&
       instruction.op != TpInstructionOp::kDecodeBatch) {
@@ -975,7 +983,6 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
     AppendU32(&payload, instruction.offset);
     AppendU32(&payload, instruction.count);
     AppendU32(&payload, instruction.prompt_size);
-    AppendU64(&payload, instruction.transfer);
     AppendU64(&payload, instruction.digest);
     AppendU64(&payload, instruction.rng);
     AppendU32(&payload, static_cast<std::uint32_t>(instruction.pending));
@@ -983,6 +990,8 @@ bool TpControlChannel::SendCommand(const TpControlCommand& command,
     AppendU32(&payload, instruction.is_private);
     AppendU64(&payload, instruction.first);
     AppendU64(&payload, instruction.end);
+    AppendU64(&payload, instruction.key);
+    AppendU64(&payload, instruction.key_first);
     AppendU32(&payload,
               static_cast<std::uint32_t>(instruction.positions.size()));
     for (const auto& [component, rows] : instruction.positions) {
@@ -1171,7 +1180,6 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
         !ReadU32(command_prompt_, &offset, &instruction.offset, error) ||
         !ReadU32(command_prompt_, &offset, &instruction.count, error) ||
         !ReadU32(command_prompt_, &offset, &instruction.prompt_size, error) ||
-        !ReadU64(command_prompt_, &offset, &instruction.transfer, error) ||
         !ReadU64(command_prompt_, &offset, &instruction.digest, error) ||
         !ReadU64(command_prompt_, &offset, &instruction.rng, error) ||
         !ReadU32(command_prompt_, &offset, &pending_bits, error) ||
@@ -1179,6 +1187,8 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
         !ReadU32(command_prompt_, &offset, &instruction.is_private, error) ||
         !ReadU64(command_prompt_, &offset, &instruction.first, error) ||
         !ReadU64(command_prompt_, &offset, &instruction.end, error) ||
+        !ReadU64(command_prompt_, &offset, &instruction.key, error) ||
+        !ReadU64(command_prompt_, &offset, &instruction.key_first, error) ||
         !ReadU32(command_prompt_, &offset, &position_count, error) ||
         position_count > kMaxCachePositions) {
       return reject("TP control instruction is invalid");
@@ -1194,7 +1204,7 @@ bool TpControlChannel::ReceiveCommand(TpControlCommand* command,
         !ReadU32(command_prompt_, &offset, &instruction.lookahead, error) ||
         !ReadU32(command_prompt_, &offset, &instruction.drafts, error) ||
         !ReadU32(command_prompt_, &offset, &batch_size, error) ||
-        op > static_cast<std::uint32_t>(TpInstructionOp::kCopyOut) ||
+        op > static_cast<std::uint32_t>(TpInstructionOp::kLoadStashed) ||
         batch_size > kMaxBatchMembers) {
       return reject("TP control instruction is invalid");
     }

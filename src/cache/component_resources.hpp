@@ -49,5 +49,14 @@ struct ComponentCacheResources {
   // usable without a pool-capacity contract.
   std::size_t transfer_batch_size{1};
   std::size_t reassignment_batch_size{1};
+  // Optional disk-tier observers, for an adapter whose payloads are references
+  // to bytes kept elsewhere that must follow the disk tier's contents. Opened
+  // runs once after startup discovery, while Entries() is quiescent.
+  // Published runs once a checkpoint is durable, before its persistence
+  // sources (and so its payloads) are released, and not under cache locks.
+  // Removed is DiskStore::SetRemovalObserver's.
+  std::function<void(DiskStore&)> disk_opened;
+  std::function<void(DiskStore&, CheckpointId)> disk_published;
+  std::function<void(bool private_file, DiskFileId)> disk_removed;
 };
 }  // namespace gufo::cache

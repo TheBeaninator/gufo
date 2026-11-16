@@ -12,12 +12,14 @@
 #include <limits>
 #include <optional>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
 
+#include "src/cache/disk.hpp"
 #include "src/cache/ledger.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/response_format.hpp"
@@ -60,8 +62,10 @@ void SetError(std::string* error, std::string message) {
       return "validate";
     case TpInstructionOp::kReconcile:
       return "reconcile";
-    case TpInstructionOp::kCopyOut:
-      return "copy-out";
+    case TpInstructionOp::kStash:
+      return "stash";
+    case TpInstructionOp::kLoadStashed:
+      return "load-stashed";
     case TpInstructionOp::kDecodeBatch:
       return "batched decode";
     case TpInstructionOp::kEnd:
@@ -515,8 +519,9 @@ void TpMirroredRunner::ForgetProducer(std::uint32_t state) const noexcept {
   }
 }
 
-/// Rank 0's end of the bulk connection. Everything in flight belongs to a
-/// transfer the cache settles before it uses the buffers or the slot again.
+/// Rank 0's end of the bulk connection: rank 1's descriptors when it opens,
+/// rank 0's releases after that. Rank 1 sends nothing more, so its end closing
+/// means the peer is gone.
 class TpMirroredRunner::Bulk {
 public:
   Bulk(const TpMirroredRunner* owner, std::shared_ptr<TpBulkSocket> socket)
@@ -530,7 +535,6 @@ public:
     if (reader_.joinable()) {
       reader_.join();
     }
-    FailAll();
   }
 
   [[nodiscard]] std::vector<cache::ComponentDescriptor> ReceiveHello() {
@@ -551,194 +555,50 @@ public:
     reader_ = std::thread([this] { Read(); });
   }
 
-  [[nodiscard]] cache::Completion CopyOut(std::uint32_t state,
-                                          std::uint32_t component,
-                                          bool is_private, std::uint64_t first,
-                                          std::uint64_t end,
-                                          std::span<std::byte> destination) {
-    auto transfer = Register(destination);
-    try {
-      owner_->SendCacheOp({.op = TpInstructionOp::kCopyOut,
-                           .state = state,
-                           .transfer = transfer.first,
-                           .component = component,
-                           .is_private = is_private ? 1U : 0U,
-                           .first = first,
-                           .end = end});
-    } catch (...) {
-      Settle(transfer.first, cache::TransferResult::kFailed);
-      throw;
-    }
-    return cache::Completion(std::move(transfer.second));
+  /// Has rank 1 copy its rows [first, end) of `component` (or its private
+  /// state) into its own store under `key`, before its next call.
+  void Stash(std::uint32_t state, std::uint32_t component, bool is_private,
+             std::uint64_t first, std::uint64_t end, std::uint64_t key) const {
+    owner_->SendCacheOp({.op = TpInstructionOp::kStash,
+                         .state = state,
+                         .component = component,
+                         .is_private = is_private ? 1U : 0U,
+                         .first = first,
+                         .end = end,
+                         .key = key});
   }
-
-  [[nodiscard]] cache::Completion CopyIn(std::uint32_t state,
-                                         std::uint32_t component,
-                                         bool is_private, std::uint64_t first,
-                                         std::uint64_t end,
-                                         std::span<const std::byte> source) {
-    auto transfer = Register({});
-    std::string error;
-    if (!socket_->Send({.kind = TpBulkKind::kIn,
-                        .state = state,
-                        .component = component,
-                        .is_private = is_private ? 1U : 0U,
-                        .transfer = transfer.first,
-                        .first = first,
-                        .end = end,
-                        .bytes = source.size()},
-                       source, &error)) {
-      owner_->FailBulk("TP bulk connection lost: " + error);
-      Settle(transfer.first, cache::TransferResult::kFailed);
-    }
-    return cache::Completion(std::move(transfer.second));
+  /// Has rank 1 load its stored `key`, from entry row `key_first` on, into
+  /// rows [first, end) of `component` (or its private state); the restore's
+  /// validation reports whether it could.
+  void Load(std::uint32_t state, std::uint32_t component, bool is_private,
+            std::uint64_t first, std::uint64_t end, std::uint64_t key,
+            std::uint64_t key_first) const {
+    owner_->SendCacheOp({.op = TpInstructionOp::kLoadStashed,
+                         .state = state,
+                         .component = component,
+                         .is_private = is_private ? 1U : 0U,
+                         .first = first,
+                         .end = end,
+                         .key = key,
+                         .key_first = key_first});
+  }
+  [[nodiscard]] const std::shared_ptr<TpBulkSocket>& Socket() const noexcept {
+    return socket_;
   }
 
 private:
-  class Signal final : public cache::CompletionSignal {
-  public:
-    [[nodiscard]] bool Ready() const noexcept override {
-      const std::lock_guard<std::mutex> lock(mutex_);
-      return result_.has_value();
-    }
-    [[nodiscard]] cache::TransferResult Wait() noexcept override {
-      std::unique_lock<std::mutex> lock(mutex_);
-      settled_.wait(lock, [&] { return result_.has_value(); });
-      return *result_;
-    }
-    void Settle(cache::TransferResult result) noexcept {
-      {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        result_ = result;
-      }
-      settled_.notify_all();
-    }
-
-  private:
-    mutable std::mutex mutex_;
-    std::condition_variable settled_;
-    std::optional<cache::TransferResult> result_;
-  };
-  struct Pending {
-    std::span<std::byte> destination;
-    Signal* signal;
-    std::shared_ptr<void> keep;
-  };
-  /// The completion owns the signal, and the map keeps it alive until settled.
-  class Shared final : public cache::CompletionSignal {
-  public:
-    explicit Shared(std::shared_ptr<Signal> signal)
-        : signal_(std::move(signal)) {}
-    [[nodiscard]] bool Ready() const noexcept override {
-      return signal_->Ready();
-    }
-    [[nodiscard]] cache::TransferResult Wait() noexcept override {
-      return signal_->Wait();
-    }
-
-  private:
-    std::shared_ptr<Signal> signal_;
-  };
-
-  [[nodiscard]] std::pair<std::uint64_t,
-                          std::unique_ptr<cache::CompletionSignal>>
-  Register(std::span<std::byte> destination) {
-    auto signal = std::make_shared<Signal>();
-    const std::lock_guard<std::mutex> lock(mutex_);
-    const auto transfer = next_transfer_++;
-    if (lost_) {
-      signal->Settle(cache::TransferResult::kFailed);
-    } else {
-      pending_.emplace(transfer, Pending{destination, signal.get(), signal});
-    }
-    return {transfer, std::make_unique<Shared>(std::move(signal))};
-  }
-
-  void Settle(std::uint64_t transfer, cache::TransferResult result) {
-    std::shared_ptr<void> keep;
-    Signal* signal = nullptr;
-    {
-      const std::lock_guard<std::mutex> lock(mutex_);
-      const auto found = pending_.find(transfer);
-      if (found == pending_.end()) {
-        return;
-      }
-      signal = found->second.signal;
-      keep = std::move(found->second.keep);
-      pending_.erase(found);
-    }
-    signal->Settle(result);
-  }
-
-  void FailAll() noexcept {
-    std::unordered_map<std::uint64_t, Pending> pending;
-    {
-      const std::lock_guard<std::mutex> lock(mutex_);
-      lost_ = true;
-      pending.swap(pending_);
-    }
-    for (auto& [transfer, entry] : pending) {
-      entry.signal->Settle(cache::TransferResult::kFailed);
-    }
-  }
-
   void Read() noexcept {
+    TpBulkHeader header;
     std::string error;
-    for (;;) {
-      TpBulkHeader header;
-      if (!socket_->ReceiveHeader(&header, &error)) {
-        break;
-      }
-      if (header.kind == TpBulkKind::kInDone) {
-        Settle(header.transfer, cache::TransferResult::kSucceeded);
-        continue;
-      }
-      if (header.kind == TpBulkKind::kFailed) {
-        std::vector<std::byte> message(
-            std::min<std::uint64_t>(header.bytes, 4096));
-        if (message.size() != header.bytes ||
-            !socket_->ReceivePayload(message, &error)) {
-          break;
-        }
-        Logger::Warn(
-            "tp", "event=tp_bulk_transfer_failed reason=" +
-                      std::string(reinterpret_cast<const char*>(message.data()),
-                                  message.size()));
-        Settle(header.transfer, cache::TransferResult::kFailed);
-        continue;
-      }
-      if (header.kind != TpBulkKind::kOut) {
-        error = "unexpected frame";
-        break;
-      }
-      std::span<std::byte> destination;
-      {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        const auto found = pending_.find(header.transfer);
-        if (found != pending_.end()) {
-          destination = found->second.destination;
-        }
-      }
-      if (destination.size() != header.bytes) {
-        error = "a transfer's size does not match its request";
-        break;
-      }
-      if (!socket_->ReceivePayload(destination, &error)) {
-        break;
-      }
-      Settle(header.transfer, cache::TransferResult::kSucceeded);
+    if (socket_->ReceiveHeader(&header, &error)) {
+      error = "unexpected frame";
     }
     owner_->FailBulk("TP bulk connection lost: " + error);
-    FailAll();
   }
 
   const TpMirroredRunner* owner_;
   std::shared_ptr<TpBulkSocket> socket_;
   std::thread reader_;
-  std::mutex mutex_;
-  std::uint64_t next_transfer_{1};
-  bool lost_{false};
-  std::unordered_map<std::uint64_t, Pending> pending_;
 };
 
 /// One execution slot of the pair: rank 0's own, and the id of the slot at the
@@ -771,17 +631,69 @@ private:
 ///
 /// The components are rank 0's, then rank 1's under ids from `kPeerBase`, then
 /// `kProducer`: the request that left the rows, so a checkpoint carries its
-/// producer through RAM and disk. Rank 1's are ordinary components whose
-/// transfers cross the bulk connection, so retention, sharing, eviction and
-/// persistence are upstream's, unchanged, and a checkpoint holds both halves
-/// or neither. Rank 1's rows are never borrowed: they stay valid on rank 0
-/// only once copied.
+/// producer through RAM and disk. Rank 1's components hold references, not
+/// bytes: each row (and a private state) is a `PeerRef` naming an entry of
+/// rank 1's `TpPeerStore`, which a capture fills on rank 1 (a stash) and a
+/// restore reads back there (a load), so rank 1's half never crosses the link.
+/// Retention, sharing, eviction and persistence stay upstream's, unchanged,
+/// and a checkpoint holds both halves or neither; its references' payloads
+/// tell rank 1 when the cache drops them (`CreateComponentCacheResources`).
+/// Rank 1's rows are never borrowed.
 class TpMirroredRunner::PairAdapter final : public cache::Adapter {
 public:
   static constexpr std::uint32_t kPeerBase = 1U << 20;
   static constexpr std::uint32_t kProducer = 1U << 21;
   [[nodiscard]] static bool IsPair(cache::ComponentId id) noexcept {
     return id.value >= kPeerBase;
+  }
+  /// One row of a rank-1 component, or its private state, in rank 0's cache:
+  /// the stored entry and the entry row, checked so that bytes that are not a
+  /// reference never reach rank 1 as one.
+  struct PeerRef {
+    std::uint64_t key{0};
+    std::uint32_t row{0};
+    std::uint32_t check{0};
+  };
+  static_assert(sizeof(PeerRef) == 16);
+  [[nodiscard]] static std::uint32_t RefCheck(std::uint64_t key,
+                                              std::uint32_t row) noexcept {
+    return 0x54505246U ^ static_cast<std::uint32_t>(key) ^
+           static_cast<std::uint32_t>(key >> 32) ^ (row * 0x9E3779B1U);
+  }
+  /// Writes references to rows [0, count) of entry `key`.
+  static void WriteRefs(std::span<std::byte> bytes, std::uint64_t key) {
+    if (bytes.size() % sizeof(PeerRef) != 0) {
+      throw std::invalid_argument("TP peer reference buffer is misaligned");
+    }
+    const auto count = bytes.size() / sizeof(PeerRef);
+    for (std::size_t row = 0; row < count; ++row) {
+      const PeerRef ref{key, static_cast<std::uint32_t>(row),
+                        RefCheck(key, static_cast<std::uint32_t>(row))};
+      std::memcpy(bytes.data() + row * sizeof(PeerRef), &ref, sizeof(ref));
+    }
+  }
+  [[nodiscard]] static PeerRef ReadRef(std::span<const std::byte> bytes,
+                                       std::size_t row) {
+    PeerRef ref;
+    std::memcpy(&ref, bytes.data() + row * sizeof(PeerRef), sizeof(ref));
+    if (ref.key == 0 || ref.check != RefCheck(ref.key, ref.row)) {
+      throw std::runtime_error("TP peer reference is corrupt");
+    }
+    return ref;
+  }
+  /// The distinct entries `bytes` refers to, for releasing them.
+  [[nodiscard]] static std::vector<std::uint64_t> RefKeys(
+      std::span<const std::byte> bytes) {
+    std::vector<std::uint64_t> keys;
+    for (std::size_t row = 0; row < bytes.size() / sizeof(PeerRef); ++row) {
+      PeerRef ref;
+      std::memcpy(&ref, bytes.data() + row * sizeof(PeerRef), sizeof(ref));
+      if (ref.key != 0 && ref.check == RefCheck(ref.key, ref.row) &&
+          std::ranges::find(keys, ref.key) == keys.end()) {
+        keys.push_back(ref.key);
+      }
+    }
+    return keys;
   }
 
   PairAdapter(const TpMirroredRunner* owner,
@@ -794,7 +706,7 @@ public:
     }
     descriptors_.assign(own.begin(), own.end());
     identity_ = inner_->CompatibilityIdentity();
-    constexpr std::string_view kMarker = "tp2=pair-v1\n";
+    constexpr std::string_view kMarker = "tp2=pair-v2-peer-store\n";
     identity_.insert(identity_.end(), kMarker.begin(), kMarker.end());
     const auto add = [&](std::uint64_t value) {
       for (unsigned i = 0; i < 8; ++i) {
@@ -809,9 +721,15 @@ public:
       }
       auto descriptor = peer[i];
       descriptor.id.value += kPeerBase;
-      descriptors_.push_back(descriptor);
+      // Rank 1's layout keys the cache, though only references are kept.
       add(descriptor.row_bytes);
       add(descriptor.state_bytes);
+      if (cache::HasRows(descriptor.kind)) {
+        descriptor.row_bytes = sizeof(PeerRef);
+      } else {
+        descriptor.state_bytes = sizeof(PeerRef);
+      }
+      descriptors_.push_back(descriptor);
       const auto bytes = [](const cache::ComponentDescriptor& d) {
         return cache::HasRows(d.kind) ? d.row_bytes * d.rows_per_chunk
                                       : d.state_bytes;
@@ -952,8 +870,13 @@ public:
       return Ready();
     }
     if (id.value >= kPeerBase) {
-      return owner_->bulk_->CopyOut(pair.id, id.value - kPeerBase, true, offset,
-                                    offset + bytes.size(), bytes);
+      if (offset != 0 || bytes.size() != sizeof(PeerRef)) {
+        throw std::invalid_argument("TP peer private capture is not whole");
+      }
+      const auto key = RandomNonzero();
+      WriteRefs(bytes, key);
+      owner_->bulk_->Stash(pair.id, id.value - kPeerBase, true, 0, 1, key);
+      return Ready();
     }
     return offset == 0 && bytes.size() == Private(id)
                ? inner_->CapturePrivate(pair.inner(), id, bytes, stream)
@@ -979,8 +902,13 @@ public:
       return Ready();
     }
     if (id.value >= kPeerBase) {
-      return owner_->bulk_->CopyIn(pair.id, id.value - kPeerBase, true, offset,
-                                   offset + bytes.size(), bytes);
+      if (offset != 0 || bytes.size() != sizeof(PeerRef)) {
+        throw std::invalid_argument("TP peer private restore is not whole");
+      }
+      const auto ref = ReadRef(bytes, 0);
+      owner_->bulk_->Load(pair.id, id.value - kPeerBase, true, 0, 1, ref.key,
+                          0);
+      return Ready();
     }
     return offset == 0 && bytes.size() == Private(id)
                ? inner_->LoadPrivate(pair.inner(), id, bytes, stream)
@@ -995,8 +923,14 @@ public:
                                               cache::Stream& stream) override {
     const auto& pair = As(slot);
     if (id.value >= kPeerBase) {
-      return owner_->bulk_->CopyOut(pair.id, id.value - kPeerBase, false, first,
-                                    end, bytes);
+      if (end <= first || bytes.size() != (end - first) * sizeof(PeerRef)) {
+        throw std::invalid_argument("TP peer row capture size is invalid");
+      }
+      const auto key = RandomNonzero();
+      WriteRefs(bytes, key);
+      owner_->bulk_->Stash(pair.id, id.value - kPeerBase, false, first, end,
+                           key);
+      return Ready();
     }
     return inner_->CopyRowsOut(pair.inner(), id, first, end, bytes, stream);
   }
@@ -1014,8 +948,29 @@ public:
                                              cache::Stream& stream) override {
     auto& pair = As(slot);
     if (id.value >= kPeerBase) {
-      return owner_->bulk_->CopyIn(pair.id, id.value - kPeerBase, false, first,
-                                   end, bytes);
+      if (end <= first || bytes.size() != (end - first) * sizeof(PeerRef)) {
+        throw std::invalid_argument("TP peer row restore size is invalid");
+      }
+      // Rows may come from several entries (merged adjacent chunks): one load
+      // per run of consecutive rows of one entry.
+      std::size_t row = 0;
+      const auto rows = static_cast<std::size_t>(end - first);
+      while (row < rows) {
+        const auto ref = ReadRef(bytes, row);
+        auto next = row + 1;
+        while (next < rows) {
+          const auto following = ReadRef(bytes, next);
+          if (following.key != ref.key ||
+              following.row != ref.row + (next - row)) {
+            break;
+          }
+          ++next;
+        }
+        owner_->bulk_->Load(pair.id, id.value - kPeerBase, false, first + row,
+                            first + next, ref.key, ref.row);
+        row = next;
+      }
+      return Ready();
     }
     return inner_->CopyRowsIn(pair.inner(), id, first, end, bytes, stream);
   }
@@ -1511,6 +1466,122 @@ std::string TpMirroredRunner::Decode(
   return inner_->Decode(tokens);
 }
 
+/// Tells rank 1 which of rank 0's disk files hold references to its stored
+/// halves: once published, with the keys they name, and once unlinked.
+class TpMirroredRunner::DiskMirror {
+public:
+  explicit DiskMirror(std::shared_ptr<TpBulkSocket> socket)
+      : socket_(std::move(socket)) {}
+
+  void Opened(cache::DiskStore& store) {
+    std::vector<std::byte> list;
+    const std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& entry : store.Entries()) {
+      ForEachPeerFile(entry.Manifest(), [&](bool private_file,
+                                            const cache::DiskPayload& payload) {
+        if (announced_.insert({private_file, payload.file}).second) {
+          const auto* id =
+              reinterpret_cast<const std::byte*>(payload.file.data());
+          list.insert(list.end(), id, id + payload.file.size());
+          list.push_back(
+              std::byte{private_file ? std::uint8_t{1} : std::uint8_t{0}});
+        }
+      });
+    }
+    Send({.kind = TpBulkKind::kLive, .bytes = list.size()}, list);
+  }
+
+  void Published(cache::DiskStore& store, cache::CheckpointId id) {
+    const auto snapshot = store.Open(id);
+    if (!snapshot) {
+      return;
+    }
+    std::vector<std::uint8_t> staging;
+    ForEachPeerFile(
+        snapshot->Manifest(),
+        [&](bool private_file, const cache::DiskPayload& payload) {
+          const TpDiskFile file{private_file, payload.file};
+          {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            if (announced_.contains(file)) {
+              return;  // an earlier checkpoint's chunk, already announced
+            }
+          }
+          try {
+            // The references just written, read back and checked.
+            std::vector<std::byte> refs(payload.bytes);
+            staging.resize(
+                std::clamp<std::size_t>(payload.bytes, 4096, 1U << 20));
+            (void)store.ReadPayload(
+                *snapshot, private_file, payload, staging,
+                [&](std::uint64_t offset, std::span<const std::uint8_t> piece) {
+                  std::memcpy(refs.data() + offset, piece.data(), piece.size());
+                });
+            const auto keys = PairAdapter::RefKeys(refs);
+            std::vector<std::byte> message(file.second.size() +
+                                           keys.size() * sizeof(std::uint64_t));
+            std::memcpy(message.data(), file.second.data(), file.second.size());
+            std::memcpy(message.data() + file.second.size(), keys.data(),
+                        keys.size() * sizeof(std::uint64_t));
+            const std::lock_guard<std::mutex> lock(mutex_);
+            if (announced_.insert(file).second) {
+              Send({.kind = TpBulkKind::kPublished,
+                    .is_private = private_file ? 1U : 0U,
+                    .bytes = message.size()},
+                   message);
+            }
+          } catch (const std::exception& exception) {
+            // Rank 1 keeps no copy: restoring this checkpoint will miss.
+            Logger::Warn("tp",
+                         std::string("event=tp_disk_mirror_failed reason=") +
+                             exception.what());
+          }
+        });
+  }
+
+  /// Runs under the disk store's locks: no store calls, one small send.
+  void Removed(bool private_file, const cache::DiskFileId& id) noexcept {
+    try {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      if (announced_.erase({private_file, id}) != 0) {
+        Send({.kind = TpBulkKind::kRemoved,
+              .is_private = private_file ? 1U : 0U,
+              .bytes = id.size()},
+             std::as_bytes(std::span(id)));
+      }
+    } catch (...) {
+    }
+  }
+
+private:
+  template<class F>
+  static void ForEachPeerFile(const cache::DiskManifest& manifest, F&& f) {
+    for (const auto& component : manifest.components) {
+      if (!PairAdapter::IsPair(component.descriptor.id) ||
+          component.descriptor.id.value == PairAdapter::kProducer) {
+        continue;
+      }
+      for (const auto& chunk : component.chunks) {
+        f(false, chunk);
+      }
+      for (const auto& piece : {component.tail, component.private_state}) {
+        if (piece) {
+          f(true, *piece);
+        }
+      }
+    }
+  }
+  void Send(const TpBulkHeader& header, std::span<const std::byte> payload) {
+    std::string ignored;
+    // A lost connection fails the pair anyway: nothing to mirror then.
+    (void)socket_->Send(header, payload, &ignored);
+  }
+
+  std::shared_ptr<TpBulkSocket> socket_;
+  std::mutex mutex_;
+  std::set<TpDiskFile> announced_;
+};
+
 std::unique_ptr<ComponentCacheResources>
 TpMirroredRunner::CreateComponentCacheResources(cache::ResourceLedger& ledger,
                                                 std::size_t ram) const {
@@ -1522,16 +1593,68 @@ TpMirroredRunner::CreateComponentCacheResources(cache::ResourceLedger& ledger,
       std::make_unique<PairAdapter>(this, std::move(resources->adapter));
   const auto largest_component = pair->LargestComponent();
   // The provider sizes its allocations by the components it was built with.
-  // Rank 1's take whole shared backing pages too, so they ask under the
-  // provider's largest class; the request's bytes still bound the allocation.
-  auto allocate = std::move(resources->allocate);
-  resources->allocate = [allocate = std::move(allocate),
-                         largest =
-                             largest_component](cache::PayloadRequest request) {
-    if (PairAdapter::IsPair(request.component)) {
-      request.component = largest;
+  // Rank 1's references take whole shared backing pages too, so they ask under
+  // the provider's largest class; the request's bytes still bound them. Their
+  // payload tells rank 1 when the cache drops it, so rank 1 frees its RAM copy
+  // (`TpPeerStore::Release`).
+  struct PeerRefs {
+    PeerRefs(cache::Payload references, std::vector<std::uint64_t> stored,
+             std::shared_ptr<TpBulkSocket> connection)
+        : payload(std::move(references)),
+          keys(std::move(stored)),
+          socket(std::move(connection)) {}
+    PeerRefs(const PeerRefs&) = delete;
+    PeerRefs& operator=(const PeerRefs&) = delete;
+    ~PeerRefs() {
+      for (const auto key : keys) {
+        try {
+          std::string ignored;
+          // A lost connection fails the pair anyway: nothing to release then.
+          (void)socket->Send({.kind = TpBulkKind::kRelease, .transfer = key},
+                             {}, &ignored);
+        } catch (...) {
+        }
+      }
     }
-    return allocate(request);
+    cache::Payload payload;
+    std::vector<std::uint64_t> keys;
+    std::shared_ptr<TpBulkSocket> socket;
+  };
+  auto allocate = std::move(resources->allocate);
+  resources->allocate =
+      [allocate = std::move(allocate), largest = largest_component,
+       socket = bulk_->Socket()](cache::PayloadRequest request) {
+        if (!PairAdapter::IsPair(request.component)) {
+          return allocate(request);
+        }
+        request.component = largest;
+        auto buffer = allocate(request);
+        const auto refs = buffer.bytes.first(request.bytes);
+        buffer.finish = [finish = std::move(buffer.finish), refs, socket] {
+          auto holder = std::make_shared<PeerRefs>(
+              finish(), PairAdapter::RefKeys(refs), socket);
+          auto charge = holder->payload.CommittedCharge();
+          // The owner's address is the payload's bytes to the cache: keep it,
+          // under the holder's lifetime.
+          const void* data = holder->payload.Owner().get();
+          return cache::Payload::Committed(
+              std::move(charge),
+              std::shared_ptr<const void>(std::move(holder), data));
+        };
+        buffer.borrow = {};
+        return buffer;
+      };
+  // Rank 1's disk tier mirrors this one (`TpPeerStore`).
+  auto mirror = std::make_shared<DiskMirror>(bulk_->Socket());
+  resources->disk_opened = [mirror](cache::DiskStore& store) {
+    mirror->Opened(store);
+  };
+  resources->disk_published = [mirror](cache::DiskStore& store,
+                                       cache::CheckpointId id) {
+    mirror->Published(store, id);
+  };
+  resources->disk_removed = [mirror](bool private_file, cache::DiskFileId id) {
+    mirror->Removed(private_file, id);
   };
   resources->adapter = std::move(pair);
   return resources;
@@ -1935,24 +2058,23 @@ public:
 };
 }  // namespace
 
-/// Rank 1's end of the bulk connection: one thread sends what the control
-/// channel asked for, in order, and another applies what rank 0 restores.
-/// Rank 0 settles a slot's transfers before it runs that slot again, so both
-/// run beside model calls on other slots.
+/// Rank 1's end of the bulk connection: its descriptors once, then rank 0's
+/// releases, which a thread applies to the store.
 class TpExecutor::Bulk {
 public:
   Bulk(TpExecutor* owner, std::shared_ptr<TpBulkSocket> socket)
       : owner_(owner), socket_(std::move(socket)) {}
   ~Bulk() {
     {
-      const std::lock_guard<std::mutex> lock(mutex_);
-      stopping_ = true;
+      std::unique_lock<std::mutex> lock(mutex_);
+      // Releases rank 0 sent before it closed its end still count: they tell
+      // the store which halves to keep on disk.
+      if (in_.joinable()) {
+        (void)received_.wait_for(lock, std::chrono::seconds(2),
+                                 [&] { return received_all_; });
+      }
     }
-    wake_.notify_all();
     socket_->Shutdown();
-    if (out_.joinable()) {
-      out_.join();
-    }
     if (in_.joinable()) {
       in_.join();
     }
@@ -1966,183 +2088,169 @@ public:
     }
   }
   void Start() {
-    out_ = std::thread([this] { SendLoop(); });
     in_ = std::thread([this] { ReceiveLoop(); });
-  }
-  void EnqueueOut(const TpInstruction& instruction) {
-    {
-      const std::lock_guard<std::mutex> lock(mutex_);
-      jobs_.push_back(instruction);
-    }
-    wake_.notify_all();
   }
 
 private:
-  class Buffer {
-  public:
-    explicit Buffer(TpExecutor* owner) : owner_(owner) {}
-    [[nodiscard]] std::span<std::byte> Get(std::size_t bytes) {
-      if (bytes > size_) {
-        const auto size = std::max<std::size_t>(std::bit_ceil(bytes), 1U << 20);
-        auto allocation = owner_->resources_->staging(size);
-        owner_allocation_ = std::move(allocation.owner);
-        data_ = reinterpret_cast<std::byte*>(allocation.bytes.data());
-        size_ = size;
-      }
-      return {data_, bytes};
-    }
-
-  private:
-    TpExecutor* owner_;
-    std::shared_ptr<void> owner_allocation_;
-    std::byte* data_{nullptr};
-    std::size_t size_{0};
-  };
-
-  [[nodiscard]] std::unique_ptr<cache::Stream> Stream() const {
-    for (;;) {
-      if (auto stream = owner_->resources_->stream()) {
-        return stream;
-      }
-      std::this_thread::sleep_for(std::chrono::microseconds(100));
-    }
-  }
-  void Settle(cache::Completion& completion) const {
-    if (completion.Wait() != cache::TransferResult::kSucceeded) {
-      throw std::runtime_error("device transfer failed");
-    }
-  }
-  [[nodiscard]] bool Fail(std::uint64_t transfer, const std::string& reason) {
-    const std::string message = reason.substr(0, 4096);
-    std::string error;
-    return socket_->Send(
-        {.kind = TpBulkKind::kFailed,
-         .transfer = transfer,
-         .bytes = message.size()},
-        std::as_bytes(std::span<const char>(message.data(), message.size())),
-        &error);
-  }
-  void SendLoop() noexcept {
-    Buffer buffer(owner_);
-    for (;;) {
-      TpInstruction job;
-      {
-        std::unique_lock<std::mutex> lock(mutex_);
-        wake_.wait(lock, [&] { return stopping_ || !jobs_.empty(); });
-        if (stopping_) {
-          return;
-        }
-        job = std::move(jobs_.front());
-        jobs_.pop_front();
-      }
-      try {
-        auto& slot = *owner_->slots_.at(job.state);
-        const cache::ComponentId id{job.component};
-        const std::size_t bytes =
-            job.is_private != 0 ? job.end - job.first
-                                : (job.end - job.first) * owner_->RowBytes(id);
-        const auto destination = buffer.Get(bytes);
-        const auto stream = Stream();
-        auto completion =
-            job.is_private != 0
-                ? owner_->adapter_->CapturePrivatePiece(slot, id, job.first,
-                                                        destination, *stream)
-                : owner_->adapter_->CopyRowsOut(slot, id, job.first, job.end,
-                                                destination, *stream);
-        Settle(completion);
-        std::string error;
-        if (!socket_->Send({.kind = TpBulkKind::kOut,
-                            .state = job.state,
-                            .component = job.component,
-                            .is_private = job.is_private,
-                            .transfer = job.transfer,
-                            .first = job.first,
-                            .end = job.end,
-                            .bytes = bytes},
-                           destination, &error)) {
-          return;
-        }
-      } catch (const std::exception& exception) {
-        if (!Fail(job.transfer, exception.what())) {
-          return;
-        }
-      }
-    }
-  }
   void ReceiveLoop() noexcept {
-    Buffer buffer(owner_);
+    constexpr std::size_t kFileBytes = 16;
+    constexpr std::uint64_t kMaxPayload = std::uint64_t{1} << 28;
+    std::vector<std::byte> payload;
     for (;;) {
       TpBulkHeader header;
       std::string error;
       if (!socket_->ReceiveHeader(&header, &error) ||
-          header.kind != TpBulkKind::kIn) {
-        return;
+          header.bytes > kMaxPayload) {
+        break;
       }
-      std::span<std::byte> source;
+      const auto bytes = static_cast<std::size_t>(header.bytes);
+      const bool valid =
+          header.kind == TpBulkKind::kRelease ? bytes == 0
+          : header.kind == TpBulkKind::kPublished
+              ? bytes >= kFileBytes && (bytes - kFileBytes) % 8 == 0
+          : header.kind == TpBulkKind::kRemoved ? bytes == kFileBytes
+          : header.kind == TpBulkKind::kLive    ? bytes % (kFileBytes + 1) == 0
+                                                : false;
+      if (!valid) {
+        break;
+      }
       try {
-        source = buffer.Get(header.bytes);
-      } catch (const std::exception& exception) {
-        // Nothing in this connection can follow an unread payload.
-        (void)Fail(header.transfer, exception.what());
-        return;
+        payload.resize(bytes);
+      } catch (...) {
+        break;
       }
-      if (!socket_->ReceivePayload(source, &error)) {
-        return;
+      if (bytes != 0 && !socket_->ReceivePayload(payload, &error)) {
+        break;
       }
+      const auto file_at = [&](std::size_t offset, bool is_private) {
+        TpDiskFile file{is_private, {}};
+        std::memcpy(file.second.data(), payload.data() + offset, kFileBytes);
+        return file;
+      };
       try {
-        auto& slot = *owner_->slots_.at(header.state);
-        const cache::ComponentId id{header.component};
-        const auto stream = Stream();
-        auto completion =
-            header.is_private != 0
-                ? owner_->adapter_->LoadPrivatePiece(slot, id, header.first,
-                                                     source, *stream)
-                : owner_->adapter_->CopyRowsIn(slot, id, header.first,
-                                               header.end, source, *stream);
-        Settle(completion);
-        if (!socket_->Send(
-                {.kind = TpBulkKind::kInDone, .transfer = header.transfer}, {},
-                &error)) {
-          return;
+        switch (header.kind) {
+          case TpBulkKind::kRelease:
+            owner_->store_->Release(header.transfer);
+            break;
+          case TpBulkKind::kPublished: {
+            std::vector<std::uint64_t> keys((bytes - kFileBytes) / 8);
+            std::memcpy(keys.data(), payload.data() + kFileBytes,
+                        keys.size() * 8);
+            owner_->store_->Published(file_at(0, header.is_private != 0), keys);
+            break;
+          }
+          case TpBulkKind::kRemoved:
+            owner_->store_->Removed(file_at(0, header.is_private != 0));
+            break;
+          case TpBulkKind::kLive: {
+            std::vector<TpDiskFile> files;
+            for (std::size_t at = 0; at < bytes; at += kFileBytes + 1) {
+              files.push_back(
+                  file_at(at, payload[at + kFileBytes] != std::byte{0}));
+            }
+            owner_->store_->Live(files);
+            break;
+          }
+          default:
+            break;
         }
       } catch (const std::exception& exception) {
-        if (!Fail(header.transfer, exception.what())) {
-          return;
-        }
+        Logger::Warn("tp", std::string("event=tp_peer_store_notice_failed "
+                                       "reason=") +
+                               exception.what());
       }
     }
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      received_all_ = true;
+    }
+    received_.notify_all();
   }
 
   TpExecutor* owner_;
   std::shared_ptr<TpBulkSocket> socket_;
-  std::thread out_;
   std::thread in_;
   std::mutex mutex_;
-  std::condition_variable wake_;
-  std::deque<TpInstruction> jobs_;
-  bool stopping_{false};
+  std::condition_variable received_;
+  bool received_all_{false};
 };
 
-std::size_t TpExecutor::RowBytes(cache::ComponentId id) const {
+std::span<std::byte> TpExecutor::Staging(std::size_t bytes) {
+  if (bytes > staging_.size()) {
+    const auto size = std::max<std::size_t>(std::bit_ceil(bytes), 1U << 20);
+    auto allocation = resources_->staging(size);
+    staging_owner_ = std::move(allocation.owner);
+    staging_ = {reinterpret_cast<std::byte*>(allocation.bytes.data()), size};
+  }
+  return staging_.first(bytes);
+}
+
+void TpExecutor::RunStored(const TpInstruction& job) {
+  auto& slot = *slots_.at(job.state);
+  const cache::ComponentId id{job.component};
+  const auto& descriptor = Descriptor(id);
+  const bool whole = job.is_private != 0;
+  if (whole != (descriptor.kind == cache::ComponentKind::kPrivateState)) {
+    throw std::invalid_argument("TP stored transfer names the wrong component");
+  }
+  std::unique_ptr<cache::Stream> stream;
+  while ((stream = resources_->stream()) == nullptr) {
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+  }
+  const auto settle = [](cache::Completion completion) {
+    if (completion.Wait() != cache::TransferResult::kSucceeded) {
+      throw std::runtime_error("device transfer failed");
+    }
+  };
+  if (job.op == TpInstructionOp::kStash) {
+    const std::size_t rows = whole ? 1 : job.end - job.first;
+    const cache::PayloadRequest request{
+        id,
+        whole ? cache::ResourceCategory::kPrivateState
+              : cache::ResourceCategory::kBackingAssigned,
+        whole ? 0 : job.first, whole ? 0 : job.end,
+        whole ? descriptor.state_bytes : rows * descriptor.row_bytes};
+    store_->Stash(
+        job.key, request, rows, [&](std::span<std::byte> destination) {
+          settle(whole
+                     ? adapter_->CapturePrivate(slot, id, destination, *stream)
+                     : adapter_->CopyRowsOut(slot, id, job.first, job.end,
+                                             destination, *stream));
+        });
+    return;
+  }
+  store_->Load(
+      job.key, id, whole, whole ? 0 : job.key_first,
+      whole ? 1 : job.key_first + (job.end - job.first),
+      [&](std::size_t bytes) { return Staging(bytes); },
+      [&](std::span<const std::byte> source) {
+        settle(whole ? adapter_->LoadPrivate(slot, id, source, *stream)
+                     : adapter_->CopyRowsIn(slot, id, job.first, job.end,
+                                            source, *stream));
+      });
+}
+
+const cache::ComponentDescriptor& TpExecutor::Descriptor(
+    cache::ComponentId id) const {
   for (const auto& descriptor : adapter_->Components()) {
-    if (descriptor.id == id && cache::HasRows(descriptor.kind)) {
-      return descriptor.row_bytes;
+    if (descriptor.id == id) {
+      return descriptor;
     }
   }
-  throw std::invalid_argument("TP transfer names no row component");
+  throw std::invalid_argument("TP transfer names no component");
 }
 
 TpExecutor::TpExecutor(std::shared_ptr<TextModelRunner> runner,
                        std::size_t state_count,
                        std::shared_ptr<TpBulkSocket> bulk,
-                       std::shared_ptr<TpCallScope> scope)
+                       std::shared_ptr<TpCallScope> scope,
+                       TpPeerStoreOptions store)
     : runner_(std::move(runner)), scope_(std::move(scope)) {
   if (runner_ == nullptr || state_count == 0 || bulk == nullptr) {
     throw std::invalid_argument(
         "TP executor needs a runner, a state and a bulk connection");
   }
-  // The slots' accounting only: rank 1 retains no checkpoints, so nothing here
-  // draws on these limits.
+  // The store's pool is bounded by its committed backing, not by the ledger.
   constexpr std::size_t kUnlimited = std::size_t{1} << 62;
   ledger_ = std::make_unique<cache::ResourceLedger>(
       cache::ResourceLimits{kUnlimited, kUnlimited, kUnlimited, kUnlimited});
@@ -2165,6 +2273,24 @@ TpExecutor::TpExecutor(std::shared_ptr<TextModelRunner> runner,
     }
     states_.push_back(std::move(state));
   }
+  // As rank 0's cache does: backing is sized and committed once the slots
+  // exist, from what the host still holds then.
+  {
+    const auto claim = runner_->ResourceClaim();
+    const auto measured = claim.retained_snapshot_capacity_bytes.value_or(0);
+    const auto ceiling =
+        claim.retained_snapshot_ceiling_bytes.value_or(measured);
+    store.ram_bytes =
+        std::min(store.ram_bytes, store.automatic_ram ? measured : ceiling);
+  }
+  if (resources_->commit_backing && store.ram_bytes != 0) {
+    resources_->commit_backing(store.ram_bytes);
+  }
+  Logger::Info("tp", "event=tp_peer_store_configured ram_bytes=" +
+                         std::to_string(store.ram_bytes) + " disk_mirror=" +
+                         (store.disk_directory.empty() ? "off" : "on"));
+  store_ =
+      std::make_unique<TpPeerStore>(resources_->allocate, std::move(store));
   bulk_->Start();
   // Rank 0's scheduler prepares its vocabulary before serving; rank 1 would
   // otherwise build its own inside the first constrained request, while rank 0
@@ -2230,7 +2356,8 @@ bool TpExecutor::Execute(const TpControlCommand& command,
   if (instruction.op == TpInstructionOp::kBeginRestore ||
       instruction.op == TpInstructionOp::kValidate ||
       instruction.op == TpInstructionOp::kReconcile ||
-      instruction.op == TpInstructionOp::kCopyOut) {
+      instruction.op == TpInstructionOp::kStash ||
+      instruction.op == TpInstructionOp::kLoadStashed) {
     return ExecuteCacheOp(command.sequence, instruction, respond, error);
   }
   if (instruction.op == TpInstructionOp::kAdvanceBatch ||
@@ -2361,9 +2488,13 @@ bool TpExecutor::ExecuteCacheOp(std::uint64_t sequence,
     }
     switch (instruction.op) {
       case TpInstructionOp::kBeginRestore:
+        failed_restores_.erase(instruction.state);
         adapter_->BeginRestore(slot, positions);
         break;
       case TpInstructionOp::kValidate:
+        if (failed_restores_.erase(instruction.state) != 0) {
+          throw std::runtime_error("rank 1 could not load its stored state");
+        }
         if (!adapter_->Validate(slot, positions)) {
           throw std::runtime_error("rank 1 refused the restored state");
         }
@@ -2372,8 +2503,20 @@ bool TpExecutor::ExecuteCacheOp(std::uint64_t sequence,
         runner_->ReconcileComponentState(StateFor(instruction.state),
                                          instruction.first);
         break;
-      case TpInstructionOp::kCopyOut:
-        bulk_->EnqueueOut(instruction);
+      case TpInstructionOp::kStash:
+      case TpInstructionOp::kLoadStashed:
+        // Unanswered: a failed stash leaves its key missing, and a failed
+        // load fails the restore's validation.
+        try {
+          RunStored(instruction);
+        } catch (const std::exception& exception) {
+          Logger::Warn("tp", std::string("event=tp_peer_store_failed op=") +
+                                 std::string(OpName(instruction.op)) +
+                                 " reason=" + exception.what());
+          if (instruction.op == TpInstructionOp::kLoadStashed) {
+            failed_restores_.insert(instruction.state);
+          }
+        }
         break;
       default:
         throw std::logic_error("not a TP cache instruction");
@@ -2515,7 +2658,8 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
       case TpInstructionOp::kBeginRestore:
       case TpInstructionOp::kValidate:
       case TpInstructionOp::kReconcile:
-      case TpInstructionOp::kCopyOut:
+      case TpInstructionOp::kStash:
+      case TpInstructionOp::kLoadStashed:
       case TpInstructionOp::kEnd:
       case TpInstructionOp::kNone:
         throw std::logic_error("TP instruction has no model call");

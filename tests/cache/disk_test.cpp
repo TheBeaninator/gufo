@@ -1201,8 +1201,38 @@ void ValidationIndependentOfStoredReferences() {
   }
   assert(full.Snapshot().total_bytes == 0);
 }
+// The removal observer sees every dependency a retirement unlinks.
+void RemovalObserver() {
+  Directory d;
+  {
+    DiskStore init(ledger, d.path, 1000);
+  }
+  auto m = Manifest();
+  Payloads(d.path, m);
+  Put(d.path, m);
+  std::vector<std::pair<bool, DiskFileId>> removed;
+  {
+    DiskStore store(ledger, d.path, UINT64_MAX);
+    store.SetRemovalObserver([&](bool private_file, DiskFileId id) {
+      removed.emplace_back(private_file, id);
+    });
+    assert(store.Retire({7}));
+  }
+  std::vector<std::pair<bool, DiskFileId>> expected;
+  for (const auto& c : m.components) {
+    for (const auto& chunk : c.chunks)
+      expected.emplace_back(false, chunk.file);
+    for (const auto& piece : {c.tail, c.private_state})
+      if (piece)
+        expected.emplace_back(true, piece->file);
+  }
+  std::ranges::sort(removed);
+  std::ranges::sort(expected);
+  assert(!expected.empty() && removed == expected);
+}
 int main() {
   Format();
+  RemovalObserver();
   ChecksumReference();
   LargePieceReadAndCorruption();
   Ownership();
