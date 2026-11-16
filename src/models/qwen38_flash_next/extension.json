@@ -125,7 +125,7 @@
   ],
   "docs": {
     "title": "Qwen3.8 Flash-Next",
-    "inputs": "Sharded Q4/Q8 GGUF; text/images, also across two hosts ([TP2](qwen3.8-flash-next/TP2.md))",
+    "inputs": "Sharded Q4/Q8 GGUF; text/images, also across two hosts (TP2)",
     "guide": "docs/models/qwen3.8-flash-next.md"
   },
   "tests": [
