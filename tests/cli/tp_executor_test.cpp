@@ -252,7 +252,8 @@ public:
                               options_.mtp ? options_.width : 0,
                           .prefix_reuse = options_.cache,
                           .prefill_alignment = options_.prefill_alignment,
-                      }};
+                      },
+            .scheduling = {.pass_tokens = 512}};
   }
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
     return {.resident_weights_bytes = 0,

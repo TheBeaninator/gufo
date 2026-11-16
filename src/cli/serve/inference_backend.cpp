@@ -549,7 +549,7 @@ bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner> runner,
         SetError(error, "TP2 requires a worker control channel");
         return false;
       }
-      if (prefill_policy.decode_active_tokens >
+      if (desc.scheduling.pass_tokens >
           std::numeric_limits<std::uint32_t>::max()) {
         SetError(error, "HTTP prefill chunk exceeds the TP control range");
         return false;
@@ -562,7 +562,7 @@ bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner> runner,
           .use_mtp = desc.capabilities.multi_token_decode,
           .auth_token = impl_->tp.auth_token,
           .prefill_chunk_tokens =
-              static_cast<std::uint32_t>(prefill_policy.decode_active_tokens),
+              static_cast<std::uint32_t>(desc.scheduling.pass_tokens),
           .sessions = static_cast<std::uint32_t>(session_count),
           .vision = desc.capabilities.supports_vision,
           .yarn = impl_->tp.yarn,
