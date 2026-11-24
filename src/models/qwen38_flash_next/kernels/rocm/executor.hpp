@@ -10,9 +10,13 @@
 #include <cstdint>
 #include <functional>
 #include <gufo/ext/experimental/host_allocations.hpp>
+#include <gufo/ext/experimental/state_memory.hpp>
+#include <gufo/ext/families/qwen/kernels/ops/token.hpp>
+#include <gufo/ext/families/qwen/vision/device_input.hpp>
 #include <gufo/ext/session_mode.hpp>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <tuple>
@@ -20,8 +24,6 @@
 #include <unordered_set>
 #include <vector>
 
-#include "src/families/qwen/kernels/ops/token.hpp"
-#include "src/families/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/communicator.hpp"
@@ -29,10 +31,21 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
+#include "src/models/qwen38_flash_next/stages.hpp"
+
+namespace gufo::models::qwen38_flash_next::rocm {
+class Executor;
+}  // namespace gufo::models::qwen38_flash_next::rocm
+
+namespace gufo::ext::qwen::flash_next {
+/// The executor behind DefaultStages.
+struct DefaultStagesImpl {
+  const models::qwen38_flash_next::rocm::Executor* executor{nullptr};
+};
+}  // namespace gufo::ext::qwen::flash_next
 
 namespace gufo::models::qwen38_flash_next::rocm {
 
-class Executor;
 class SnapshotAllocator;
 struct ArgmaxCandidate;
 struct SnapshotHeader;
@@ -123,6 +136,11 @@ public:
     return mutation_epoch_;
   }
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
+  /// The account of this session's K/V regions.
+  [[nodiscard]] const std::shared_ptr<gufo::mem::StateAccount>& state_account()
+      const noexcept {
+    return account_;
+  }
   /// PLE rows this session has gathered, including prefetches, since creation.
   [[nodiscard]] NgramTotals NgramRowTotals() const noexcept {
     return ngram_counters_.Load();
@@ -146,6 +164,8 @@ private:
   friend struct ExecutorTestAccess;  // eager/replay checks in GPU tests
   friend struct PrefillCheckpoint;
   friend class gufo::models::qwen38_flash_next::ContinuationAdapter;
+  friend struct ext::qwen::flash_next::AttentionArgs;
+  friend struct ext::qwen::flash_next::LinearAttentionArgs;
   Session() = default;
 
   struct LinearState {
@@ -217,7 +237,19 @@ private:
   /// once (the GEMM tier's arena must be grown before capture).
   std::unordered_map<std::uint64_t, hipGraphExec_t> graphs_;
   std::unordered_set<std::uint64_t> warmed_;
-  std::vector<void*> allocations_;
+  /// The session's declared state (Executor::DeclareSessionState); the
+  /// pointers above and the regions below point into it.
+  std::unique_ptr<gufo::mem::SessionState> state_;
+  /// Charges the K/V regions' pages to the shared state budget.
+  std::shared_ptr<gufo::mem::StateAccount> account_;
+  /// Trunk and MTP K/V, one region per buffer, backed as rows are written.
+  std::vector<std::shared_ptr<gufo::mem::Region>> kv_regions_;
+  std::vector<std::shared_ptr<gufo::mem::Region>> mtp_kv_regions_;
+  /// Pooled indexer keys, one region per attention layer and one for the
+  /// predictor. Small (17 MiB at 262,144 tokens), so backed whole; regions
+  /// so checkpoints share their pages like the K/V's.
+  std::vector<std::shared_ptr<gufo::mem::Region>> pooled_regions_;
+  std::vector<std::shared_ptr<gufo::mem::Region>> mtp_pooled_regions_;
   std::size_t allocated_bytes_{0};
   std::size_t rollback_bytes_{0};
   std::function<bool()> is_cancelled_;
@@ -279,8 +311,14 @@ public:
 
   struct Options {
     int device_index{0};
+    /// Widest pass. Rows past `narrow_batch` take memory only while
+    /// AcquireWidePasses() holds them (#952); without demand mapping the
+    /// executor allocates `narrow_batch` rows and never runs wider passes.
     /// Rows of one trunk batch; longer prompts are fed in chunks.
     std::uint32_t max_batch{1};
+    /// Rows every pass may take, backed for the executor's life. Zero (or
+    /// a value of at least max_batch) means max_batch.
+    std::uint32_t narrow_batch{0};
     /// Rows of logits (and hidden states) a Forward call may return.
     std::uint32_t max_logit_rows{1};
     /// Longest speculative batch; bounds the recurrent snapshot storage.
@@ -304,6 +342,9 @@ public:
     /// Largest session context. Zero selects the native context; values
     /// above it require YaRN (Config::MaxContextLength()).
     std::uint32_t max_context{0};
+    /// Per-layer stages (stages.hpp); null runs the GGUF defaults. Must
+    /// outlive the executor.
+    ext::qwen::flash_next::Stages* stages{nullptr};
   };
 
   /// The two-rank all-reduce over `communicator` for rows of `hidden` floats,
@@ -334,10 +375,40 @@ public:
       std::string* error_msg = nullptr) const;
   [[nodiscard]] bool EnsureRollback(Session& session, std::uint32_t depth,
                                     std::string* error_msg) const;
-  [[nodiscard]] std::size_t SessionBytes(
-      core::SessionMode mode, std::uint32_t max_context,
-      std::uint32_t rollback_depth) const noexcept;
+  /// Bytes one session's state takes: its declared state
+  /// (DeclareSessionState) plus `rollback_depth` rollback rows.
+  [[nodiscard]] std::size_t SessionBytes(core::SessionMode mode,
+                                         std::uint32_t max_context,
+                                         std::uint32_t rollback_depth) const;
+  /// Bytes of `depth` rollback rows of a session (EnsureRollback).
+  [[nodiscard]] std::size_t RollbackBytes(std::uint32_t depth) const noexcept;
+  /// The part of SessionBytes() a session maps only as it writes it: its
+  /// K/V regions, zero without demand mapping.
+  [[nodiscard]] std::size_t DemandMappedBytes(core::SessionMode mode,
+                                              std::uint32_t max_context) const;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
+  /// Backs the K/V rows of trunk positions below `trunk_end` and MTP
+  /// positions below `mtp_end`, plus a tile of rows past each, before they
+  /// are written or read; asks the page pool to map further ahead. Every
+  /// K/V writer calls it first, cache restores included.
+  [[nodiscard]] bool EnsureKv(Session& session, std::uint32_t trunk_end,
+                              std::uint32_t mtp_end, std::string* error) const;
+  /// Asks the page pool to back the rows EnsureKv() would, without waiting.
+  void MapKvAhead(Session& session, std::uint32_t trunk_end,
+                  std::uint32_t mtp_end) const;
+  /// Before rows [first, end) of the trunk's K/V and blocks [first_block,
+  /// end_block) of its pooled keys (the predictor's with `draft`) are
+  /// written: pages of them that a checkpoint or another session shares
+  /// become the session's own, copied where they hold rows below `kept`
+  /// (blocks below `kept_block`) and cleared otherwise
+  /// (mem::Region::PrepareWrite). One atomic read per buffer when nothing
+  /// in it can be shared.
+  [[nodiscard]] bool UnshareKv(Session& session, bool draft,
+                               std::uint32_t first, std::uint32_t end,
+                               std::uint32_t kept, std::uint32_t first_block,
+                               std::uint32_t end_block,
+                               std::uint32_t kept_block,
+                               std::string* error) const;
 
   enum class ForwardMode { kDecode, kVerify, kPrefill };
   /// Commits checkpoint slot 0 on first use. False when the device lacks
@@ -591,6 +662,29 @@ public:
     }
     return ((n + 1) / 2 + kPairGrid / 2) / kPairGrid * kPairGrid;
   }
+  [[nodiscard]] std::uint32_t narrow_batch() const noexcept {
+    return narrow_batch_;
+  }
+  /// Rows one pass may take now: max_batch while the wide scratch is
+  /// mapped, otherwise narrow_batch.
+  [[nodiscard]] std::uint32_t pass_rows() const noexcept {
+    return scratch_arena_ && scratch_arena_->transient_mapped()
+               ? options_.max_batch
+               : narrow_batch_;
+  }
+  /// Bytes the wide scratch maps beyond the narrow rows; zero when wide
+  /// passes are unavailable.
+  [[nodiscard]] std::size_t WidePassBytes() const noexcept {
+    return scratch_arena_ ? scratch_arena_->transient_bytes() : 0;
+  }
+  /// Maps the wide pass scratch when the host can spare it: free 2 MiB
+  /// blocks above the host floor and room in the device heap after the
+  /// state promised to sessions. It never evicts the RAM cache or waits.
+  /// True when wide passes may run.
+  [[nodiscard]] bool AcquireWidePasses() const;
+  /// Returns the wide scratch to the driver. Waits for in-flight GPU work;
+  /// call it between passes. A no-op while a wide pass runs.
+  void ReleaseWidePasses() const;
   [[nodiscard]] std::uint32_t max_speculative() const noexcept {
     return options_.max_speculative;
   }
@@ -602,7 +696,38 @@ public:
 
 private:
   friend struct ExecutorTestAccess;  // capture failure injection in GPU tests
+  friend class ext::qwen::flash_next::DefaultStages;
   Executor() = default;
+
+  /// One session's state as the core allocates it (mem::SessionState), and
+  /// the buffer each of the session's pointers takes. Linear layers use
+  /// `conv` and `state`, attention layers the others.
+  struct SessionStateLayout {
+    struct Layer {
+      gufo::mem::StateBufferId conv{0};
+      gufo::mem::StateBufferId state{0};
+      gufo::mem::StateBufferId k{0};
+      gufo::mem::StateBufferId v{0};
+      gufo::mem::StateBufferId index_k{0};
+      gufo::mem::StateBufferId block_k{0};
+    };
+    explicit SessionStateLayout(std::size_t margin_tokens)
+        : state(margin_tokens) {}
+    gufo::mem::StateDeclaration state;
+    std::vector<Layer> layers;
+    std::optional<gufo::mem::StateBufferId> ple_history;
+    gufo::mem::StateBufferId control{0};
+    /// MTP sessions only: `mtp` holds k, v, index_k and block_k.
+    std::optional<Layer> mtp;
+    gufo::mem::StateBufferId mtp_target_hidden{0};
+    gufo::mem::StateBufferId mtp_h{0};
+    std::optional<gufo::mem::StateBufferId> mtp_draft_rows;
+    gufo::mem::StateBufferId mtp_draft_ids{0};
+  };
+  /// The state CreateSession() allocates and SessionBytes() and
+  /// DemandMappedBytes() count.
+  [[nodiscard]] SessionStateLayout DeclareSessionState(
+      core::SessionMode mode, std::uint32_t max_context) const;
 
   /// Visits every device region of a snapshot in payload order with
   /// (device pointer or null when sizing, payload offset, bytes, name).
@@ -650,6 +775,8 @@ private:
   /// `wide_pairs`: the layer's gate/up take the paired 128-token kernel.
   bool RouteHints(std::uint32_t n_tokens, bool wide_pairs,
                   std::string* error_msg) const;
+  /// The host wait of RouteHints alone (expert counts of a wide pass).
+  bool WaitCounts(std::uint32_t n_tokens, std::string* error_msg) const;
   /// Routed gate/up projections followed by SwiGLU.
   bool GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
                     const float* x, const std::int32_t* ids, float* out,
@@ -700,12 +827,21 @@ private:
            bool embeddings_ready = false,
            std::span<PrefillCheckpoint* const> checkpoints = {},
            std::uint32_t emb_row = 0) const;
+  /// The LinearAttention stage (stages_); DefaultLinearAttention is its
+  /// GGUF default.
   bool LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                        const float* x, float* out, std::uint32_t n_tokens,
                        bool speculative, std::string* error_msg,
                        bool projections_ready = false,
                        bool project_output = true,
                        GdnCheckpoint checkpoint = {}) const;
+  bool DefaultLinearAttention(const DeviceLayer& l, Session::LinearState& s,
+                              const float* x, float* out,
+                              std::uint32_t n_tokens, bool speculative,
+                              std::string* error_msg, bool projections_ready,
+                              bool project_output,
+                              GdnCheckpoint checkpoint) const;
+  /// The Attention stage (stages_); DefaultAttention is its GGUF default.
   /// `pos`/`first_block` are device values; `start_pos` and `pool_grid`
   /// are their host-side counterparts for the eager-only decisions.
   bool Attention(const DeviceLayer& l, Session::AttentionState& s,
@@ -716,9 +852,19 @@ private:
                  bool last_only = false, bool projections_ready = false,
                  bool project_output = true,
                  PassCheckpoints checkpoints = {}) const;
-  /// Without `reduce`, a distributed rank's output stays its partial.
+  bool DefaultAttention(const DeviceLayer& l, Session::AttentionState& s,
+                        const float* x, float* out, std::uint32_t n_tokens,
+                        const std::uint32_t* pos,
+                        const std::uint32_t* first_block,
+                        std::uint32_t start_pos, std::uint32_t pool_grid,
+                        std::uint32_t max_context, bool sparse,
+                        std::string* error_msg, bool last_only,
+                        bool projections_ready, bool project_output,
+                        PassCheckpoints checkpoints) const;
   /// Orders the main stream after the work queued on side_stream_.
   bool JoinSide(std::string* error_msg) const;
+  /// Routing, then the MoeFfn stage (stages_). Without `reduce`, a
+  /// distributed rank's output stays its partial.
   bool Moe(const DeviceLayer& l, const float* x, float* out,
            std::uint32_t n_tokens, std::string* error_msg,
            bool last_only = false, bool reduce = true) const;
@@ -726,6 +872,19 @@ private:
   /// output to options_.moe_observer.
   bool AllReduce(float* data, std::size_t rows, std::string* error_msg,
                  bool observe = true) const;
+  /// The GGUF MoeFfn: shared expert (overlapped when routing.overlap),
+  /// routed experts and epilogue.
+  bool DefaultMoeFfn(const DeviceLayer& l,
+                     const ext::qwen::flash_next::MoeRouting& routing,
+                     const float* x, float* out, std::uint32_t n_tokens,
+                     std::string* error_msg) const;
+  /// The shared expert's rows into s_.shexp_out, on stream_.
+  bool SharedExpertRows(const DeviceLayer& l, const float* x,
+                        std::uint32_t n_tokens, std::string* error_msg) const;
+  /// The MoE epilogue into `out` (MoeExperts' tail): F16 down rows leave it
+  /// to the following combine when `out` is s_.block_out.
+  void MoeEpilogueRows(float* out, std::uint32_t n_tokens,
+                       bool half_down) const;
   /// Whether MoeExperts takes the routed F16 WMMA route, whose epilogue the
   /// following combine absorbs (see Moe).
   bool WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const;
@@ -752,6 +911,9 @@ private:
   bool MtpHead(const DeviceMixer& head, const float* res, bool token,
                bool confidence, bool candidates, const Session* draft,
                std::string* error_msg) const;
+  bool DefaultMtpHead(const DeviceMixer& head, const float* res, bool token,
+                      bool confidence, bool candidates, const Session* draft,
+                      std::string* error_msg) const;
   /// Enqueues one trunk batch (control and token upload through logits).
   bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
                    bool download_logits, bool speculative, bool sparse,
@@ -828,6 +990,34 @@ private:
   const DeviceModel* model_{nullptr};
   NgramTable* ngram_{nullptr};
   Options options_;
+
+  // Stages (stages.hpp). GGUF projections never reach them; tensors with a
+  // format_state go through Linear / LinearGroup.
+  ext::qwen::flash_next::Stages* stages_{nullptr};
+  ext::qwen::flash_next::DefaultStagesImpl stage_impl_{};
+  ext::qwen::flash_next::DefaultStages stage_defaults_{&stage_impl_};
+  void* stage_scratch_{nullptr};
+  std::vector<ext::qwen::flash_next::Layer> stage_layers_;
+  /// Stages::Hooks() has kPromptLayers: prompt passes run prompt_layers_.
+  bool prompt_layer_hook_{false};
+  mutable std::vector<DeviceLayer> prompt_layers_;
+  /// The handle stages see of `l` (a trunk layer, its prompt view, or the
+  /// draft block).
+  [[nodiscard]] ext::qwen::flash_next::Layer LayerHandle(
+      const DeviceLayer& l) const noexcept;
+  [[nodiscard]] ext::qwen::flash_next::StageContext StageCtx(
+      const DeviceLayer* l, std::uint32_t n_tokens,
+      std::string* error_msg) const noexcept;
+  /// Linear / LinearGroup stage calls for tensors with a format_state.
+  bool StageLinear(const DeviceTensor& w,
+                   const ext::qwen::flash_next::LinearInput& in, float* out,
+                   std::uint32_t n_tokens, std::string* error_msg) const;
+  bool StageGroup(std::span<const ext::qwen::flash_next::LinearJob> jobs,
+                  const ext::qwen::flash_next::LinearInput& in,
+                  std::uint32_t n_tokens, std::string* error_msg) const;
+  /// kPromptLayers: the layer prompt pass rows of layer `il` run on.
+  bool PromptLayer(std::uint32_t il, std::uint32_t n_tokens,
+                   const DeviceLayer** layer, std::string* error_msg) const;
   [[nodiscard]] std::shared_ptr<SnapshotAllocator> GetSnapshotAllocator() const;
   mutable std::once_flag snapshot_allocator_once_;
   mutable std::shared_ptr<SnapshotAllocator> snapshot_allocator_;
@@ -951,6 +1141,24 @@ private:
     float* mtp_scores;
   };
   mutable Scratch s_{};
+  /// Carves the buffers with a row per pass token for `rows` rows with
+  /// `allocate`; the other fields of `scratch` stay as they are.
+  [[nodiscard]] bool CarveRowScratch(
+      Scratch& scratch, std::size_t rows,
+      const std::function<void*(std::size_t)>& allocate) const;
+  /// The scratch every pass of at most narrow_batch_ rows runs on, and the
+  /// set of wider passes: the same buffers except the row buffers, which
+  /// live in scratch_arena_ and are mapped only while AcquireWidePasses()
+  /// holds them. Null arena without demand mapping (max_batch is then
+  /// narrow_batch_).
+  Scratch narrow_s_{};
+  Scratch wide_s_{};
+  std::unique_ptr<gufo::mem::ScratchArena> scratch_arena_;
+  std::uint32_t narrow_batch_{1};
+  /// Rows of the set s_ belongs to: max_batch during a wide pass.
+  mutable std::uint32_t scratch_rows_{1};
+  /// Set while a pass wider than narrow_batch_ is in flight.
+  mutable bool wide_pass_running_{false};
   [[nodiscard]] Scratch RowScratch(const Scratch& base,
                                    std::uint32_t offset) const;
   /// The same view for rows whose GDN and attention activations have the
@@ -981,6 +1189,8 @@ private:
   static constexpr std::size_t kCompactPenaltyLimit = 4096;
   std::uint32_t* verification_ids_{nullptr};
   std::uint32_t* verification_scratch_ids_{nullptr};
+  std::uint32_t* verification_allowed_masks_{nullptr};
+  std::uint32_t* verification_allowed_masks_host_{nullptr};
   sampling::LogitCandidate* verification_candidates_{nullptr};
   sampling::LogitCandidate* verification_candidates_host_{nullptr};
   mutable std::vector<sampling::TokenPenalty> verification_penalty_host_;
@@ -1072,6 +1282,7 @@ private:
   std::int32_t* tokens_host_{nullptr};
   std::uint32_t* counts_host_{nullptr};
   std::int32_t* tiles_host_{nullptr};           ///< routed tile map staging
+  std::size_t tiles_host_capacity_{0};          ///< entries of tiles_host_
   mutable std::uint32_t routed_max_rows_{0};    ///< 0 = no readback yet
   mutable std::uint32_t routed_n_tiles_{0};     ///< routed_tile_rows_ tiles
   mutable std::uint32_t routed_wide_tiles_{0};  ///< prefill 128-row tiles
@@ -1146,5 +1357,76 @@ private:
 };
 
 }  // namespace gufo::models::qwen38_flash_next::rocm
+
+namespace gufo::ext::qwen::flash_next {
+
+/// Layer and LayerEdit over device layers.
+struct LayerAccess {
+  [[nodiscard]] static Layer Make(
+      const models::qwen38_flash_next::rocm::DeviceLayer* layer,
+      std::uint32_t index) noexcept {
+    Layer handle;
+    handle.impl_ = layer;
+    handle.index_ = index;
+    return handle;
+  }
+  [[nodiscard]] static LayerEdit MakeEdit(
+      models::qwen38_flash_next::rocm::DeviceLayer* layer,
+      std::uint32_t index) noexcept {
+    LayerEdit edit;
+    edit.impl_ = layer;
+    edit.index_ = index;
+    return edit;
+  }
+  [[nodiscard]] static const models::qwen38_flash_next::rocm::DeviceLayer&
+  Device(const Layer& layer) noexcept {
+    return *static_cast<const models::qwen38_flash_next::rocm::DeviceLayer*>(
+        layer.impl_);
+  }
+  [[nodiscard]] static models::qwen38_flash_next::rocm::DeviceLayer& Device(
+      const LayerEdit& edit) noexcept {
+    return *static_cast<models::qwen38_flash_next::rocm::DeviceLayer*>(
+        edit.impl_);
+  }
+};
+
+struct AttentionArgs {
+  using Session = models::qwen38_flash_next::rocm::Session;
+  Session::AttentionState& state;
+  std::uint32_t n_tokens;
+  const std::uint32_t* pos;
+  const std::uint32_t* first_block;
+  std::uint32_t start_pos;
+  std::uint32_t pool_grid;
+  std::uint32_t max_context;
+  bool sparse;
+  bool last_only;
+  bool projections_ready;
+  bool project_output;
+  models::qwen38_flash_next::rocm::PassCheckpoints checkpoints;
+};
+
+struct LinearAttentionArgs {
+  using Session = models::qwen38_flash_next::rocm::Session;
+  Session::LinearState& state;
+  std::uint32_t n_tokens;
+  bool speculative;
+  bool projections_ready;
+  bool project_output;
+  models::qwen38_flash_next::rocm::GdnCheckpoint checkpoint;
+};
+
+struct MtpHeadArgs {
+  const models::qwen38_flash_next::rocm::DeviceMixer& head;
+  const float* res;
+  bool token;
+  bool candidates;
+  const models::qwen38_flash_next::rocm::Session* draft;
+  /// Whether the caller reads the argmax token's confidence; a greedy TP2
+  /// draft without it takes the split-vocabulary argmax.
+  bool confidence{true};
+};
+
+}  // namespace gufo::ext::qwen::flash_next
 
 #endif  // GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_EXECUTOR_HPP_

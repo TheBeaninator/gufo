@@ -42,6 +42,7 @@
 #include "src/cli/speculative_settings.hpp"
 #include "src/core/diagnostics/gpu_queues.h"
 #include "src/core/platform/shutdown_signal.hpp"
+#include "src/mem/ledger.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime_api.h>
@@ -91,6 +92,14 @@ public:
       out << " gpu_device_used_mib=" << (total - free) / (1024 * 1024)
           << " gpu_device_total_mib=" << total / (1024 * 1024);
     }
+    // State promised to sessions at full context but mapped only as written.
+    if (const auto state = mem::StateLedger::Process().Totals();
+        state.reserved_bytes != 0)
+      out << " state_reserved_mib=" << state.reserved_bytes / (1024 * 1024)
+          << " state_mapped_mib=" << state.mapped_bytes / (1024 * 1024)
+          << " state_pooled_mib=" << state.pooled_bytes / (1024 * 1024)
+          << " state_outstanding_mib="
+          << state.outstanding_bytes / (1024 * 1024);
 #else
     (void)gpu_loaded;
 #endif
@@ -916,7 +925,7 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption(
         "", "--cache-disk-staging-bytes", "N",
         "Flash-Next: pinned disk transfer buffer allocated at startup within "
-        "the RAM ceiling, not a checkpoint size limit (default: 0 = 1 MiB). "
+        "the RAM ceiling, not a checkpoint size limit (default: 0 = 8 MiB). "
         "Other models: RAM limit for queued snapshots and each disk read "
         "(default: 0 = auto, at most the disk budget and 1/8 available RAM)",
         "Cache", &cache_disk_staging_bytes);
@@ -1071,6 +1080,9 @@ int RunServe(std::span<const char* const> args) {
   // `queue_budget` line already obeys `--log-level`. Help output loads nothing
   // and returns before that point.
 
+  // Queue cap a speech provider declares in its metadata; zero keeps the
+  // modality default. Set by the speech branch before prepare_server_options.
+  std::uint32_t provider_hardware_queues = 0;
   const auto prepare_server_options = [&] {
     if (!gufo::server::IsListenAddress(host)) {
       std::cerr << "Error: --host must be an IPv4 or IPv6 address\n";
@@ -1108,9 +1120,9 @@ int RunServe(std::span<const char* const> args) {
                          : (subcommand == "tts" || subcommand == "asr")
                              ? diagnostics::QueueProfile::kAudio
                              : diagnostics::QueueProfile::kUnmeasured;
-    const auto plan =
-        diagnostics::PlanQueues(profile, diagnostics::QueryQueueCensus(),
-                                std::getenv("GPU_MAX_HW_QUEUES"));
+    const auto plan = diagnostics::PlanQueues(
+        profile, diagnostics::QueryQueueCensus(),
+        std::getenv("GPU_MAX_HW_QUEUES"), provider_hardware_queues);
     diagnostics::ApplyQueuePlan(plan);
     server::Logger::Info("gpu",
                          diagnostics::DescribeQueuePlan(subcommand, plan));
@@ -1438,6 +1450,23 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: " << error.what() << '\n';
       return 2;
     }
+    // The queue cap is fixed by the first HIP dispatch, so the provider is
+    // found here from the model files alone, by the probe the service runs to
+    // select it.
+    if (!options.model.empty()) {
+      const std::string model_root = options.model.string();
+      std::string provider_id;
+      if (is_tts) {
+        if (const auto* found = ext::ProbeTtsProvider(model_root))
+          provider_id = found->id;
+      } else if (const auto* found = ext::ProbeAsrProvider(model_root)) {
+        provider_id = found->id;
+      }
+      for (const auto& info : registry.Providers()) {
+        if (!provider_id.empty() && info.id == provider_id)
+          provider_hardware_queues = info.hardware_queues;
+      }
+    }
     if (!prepare_server_options())
       return 2;
     if (options.model.empty()) {
@@ -1716,7 +1745,7 @@ int RunServe(std::span<const char* const> args) {
     llm_parser.AddOption(
         "", "--cache-disk-staging-bytes", "N",
         "Flash-Next: pinned disk transfer buffer allocated at startup within "
-        "the RAM ceiling, not a checkpoint size limit (default: 0 = 1 MiB). "
+        "the RAM ceiling, not a checkpoint size limit (default: 0 = 8 MiB). "
         "Other models: RAM limit for queued snapshots and each disk read "
         "(default: 0 = auto, at most the disk budget and 1/8 available RAM)",
         "Cache", &cache_disk_staging_bytes);
@@ -1837,11 +1866,8 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: " << exception.what() << '\n';
       return 2;
     }
-    if (speculative_config.backend == server::TextSpeculativeBackend::kDFlash &&
-        dflash_model_path.empty()) {
-      std::cerr << "Error: DFlash2 requires --dflash-model\n";
-      return 2;
-    }
+    // A missing draft model is the runner's to reject: a checkpoint may carry
+    // its own draft.
     speculative_config.draft_model_path =
         speculative_config.backend == server::TextSpeculativeBackend::kDSpark
             ? dspark_model_path
@@ -1949,6 +1975,10 @@ int RunServe(std::span<const char* const> args) {
     std::string err;
     ModelLoadLog load_log("text", model);
     server::TextSpeculativeConfig loaded_speculative = speculative_config;
+    // A provider that declares `serving.hip: false` drives the GPU through its
+    // own runtime, which cannot share the device with HIP in one process: the
+    // server then makes no HIP call at all.
+    bool provider_uses_hip = true;
     backend = std::make_shared<server::InferenceBackend>();
     backend->set_tp_config(tp_config);
     // The disk snapshot tier is walked during load, which can take minutes.
@@ -1985,10 +2015,14 @@ int RunServe(std::span<const char* const> args) {
             .model_artifact_fingerprint = {},
         },
         vision_model_path, cache_ram, enable_yarn,
-        [&](const ext::TextProvider& provider, const core::GgufReader&,
+        [&](const ext::TextProvider& provider, const core::GgufReader*,
             ext::TextRunnerOptions* options, std::string* error) {
           try {
             options->provider_options = provider_options.Select(provider.id);
+            for (const auto& info : registry.Providers()) {
+              if (info.id == provider.id)
+                provider_uses_hip = info.uses_hip;
+            }
             ApplySpeculativeSettings(
                 ResolveSpeculativeSettings(provider, speculative_backend, {}),
                 &options->speculative);
@@ -1998,6 +2032,11 @@ int RunServe(std::span<const char* const> args) {
             *error = exception.what();
             return false;
           }
+        },
+        [&loading](double progress, std::string_view message) {
+          // A TP2 rank 1 serves no loading responder.
+          if (loading)
+            loading->SetProgress(progress, message);
         });
     if (loading) {
       loading->stop();
@@ -2055,14 +2094,16 @@ int RunServe(std::span<const char* const> args) {
     }
     load_log.Complete(
         "model=" + backend->model_id() +
-        " sessions=" + std::to_string(session_count) + " context_tokens=" +
-        std::to_string(backend->max_context()) + " speculative=" + speculation +
-        " draft_limit=" + std::to_string(loaded_speculative.max_draft_tokens) +
-        (loaded_speculative.draft_policy.empty()
-             ? std::string()
-             : " draft_policy=" + loaded_speculative.draft_policy) +
-        " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled") +
-        served_names);
+            " sessions=" + std::to_string(session_count) +
+            " context_tokens=" + std::to_string(backend->max_context()) +
+            " speculative=" + speculation + " draft_limit=" +
+            std::to_string(loaded_speculative.max_draft_tokens) +
+            (loaded_speculative.draft_policy.empty()
+                 ? std::string()
+                 : " draft_policy=" + loaded_speculative.draft_policy) +
+            " disk_cache=" +
+            (cache_disk_directory.empty() ? "off" : "enabled") + served_names,
+        provider_uses_hip);
 #if defined(ENGINE_ENABLE_HIP)
     if (tp_world_size == 2 && tp_rank == 1) {
       std::string worker_error;
@@ -2093,6 +2134,7 @@ int RunServe(std::span<const char* const> args) {
       server::HttpServerOptions{
           .max_request_body_bytes = max_request_body_bytes,
           .max_connections = max_connections,
+          .keep_alive = true,
           .on_device_lost =
               [&device_lost] {
                 device_lost.store(true);

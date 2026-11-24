@@ -12,6 +12,14 @@ crate-type = ["staticlib"]
 [dependencies]
 gufo-audio-decode = { path = "../audio_decode" }
 gufo-base64 = { path = "../base64" }
+gufo-cache-manifest = { path = "../cache_manifest" }
+gufo-chat-request = { path = "../chat_request" }
+gufo-generation-parse = { path = "../generation_parse" }
+gufo-gguf = { path = "../gguf" }
 gufo-http = { path = "../http" }
-gufo-png-decode = { path = "../png_decode" }
+gufo-http-server = { path = "../http_server" }
+gufo-jpeg-decode = { path = "../jpeg_decode" }
+gufo-json = { path = "../json" }
+gufo-json-schema = { path = "../json_schema" }
+gufo-png = { path = "../png" }
 gufo-websocket = { path = "../websocket" }
