@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "src/models/qwen38_flash_next/distributed/rdma_gid.hpp"
+#include "src/models/qwen38_flash_next/distributed/tp_fault.hpp"
 
 #ifndef MAP_ANONYMOUS
 #define MAP_ANONYMOUS MAP_ANON
@@ -94,6 +95,17 @@ constexpr auto kReceiveSpinWindow = std::chrono::microseconds(500);
 // An exchange waits for a layer of GPU work, or a peer that is a layer behind:
 // spinning that long keeps the wake-up latency off every decode exchange.
 constexpr auto kExchangeSpinWindow = std::chrono::milliseconds(5);
+// The fault contract names completions by these values (tp_fault.hpp).
+static_assert(IBV_WC_WR_FLUSH_ERR == distributed::kWcWrFlushErr &&
+              IBV_WC_REM_INV_REQ_ERR == distributed::kWcRemInvReqErr &&
+              IBV_WC_REM_ACCESS_ERR == distributed::kWcRemAccessErr &&
+              IBV_WC_REM_OP_ERR == distributed::kWcRemOpErr &&
+              IBV_WC_RETRY_EXC_ERR == distributed::kWcRetryExcErr &&
+              IBV_WC_RNR_RETRY_EXC_ERR == distributed::kWcRnrRetryExcErr &&
+              IBV_WC_REM_INV_RD_REQ_ERR == distributed::kWcRemInvRdReqErr &&
+              IBV_WC_REM_ABORT_ERR == distributed::kWcRemAbortErr);
+// A poison frame's partial read waits at most this for the rest.
+constexpr auto kPoisonReadWait = std::chrono::milliseconds(100);
 constexpr int kMemoryAccessFlags =
     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
 
@@ -539,7 +551,10 @@ public:
       return false;
     }
     completion_channel_ = ibv_create_comp_channel(context_);
-    cq_ = ibv_create_cq(context_, 16, nullptr, completion_channel_, 0);
+    // One CQ takes both queues' completions. Sized to both queues' depth
+    // (max_send_wr + max_recv_wr below) it cannot overrun whatever is in
+    // flight; an overrun moves the QP to error (TP2.md, mlx5 notes).
+    cq_ = ibv_create_cq(context_, 32, nullptr, completion_channel_, 0);
     if (cq_ == nullptr) {
       SetError(error, "ibv_create_cq failed");
       return false;
@@ -633,6 +648,9 @@ public:
     init.cap.max_send_sge = 1;
     init.cap.max_recv_sge = 1;
     init.qp_type = IBV_QPT_RC;
+    // Not signaled by default, but every send sets IBV_SEND_SIGNALED: mlx5
+    // reaps send WQEs only when a signaled completion is polled, so a run of
+    // unsignaled sends fills the send queue (TP2.md, mlx5 notes).
     init.sq_sig_all = 0;
     qp_ = ibv_create_qp(pd_, &init);
     if (qp_ == nullptr) {
@@ -716,6 +734,11 @@ public:
     attr = {};
     attr.qp_state = IBV_QPS_RTS;
     attr.sq_psn = 0;
+    // Local ACK timeout 4.096 us x 2^14 = 67 ms and 7 retries: a write the
+    // peer's NIC never acknowledges (a dead rank's QP, a cut link) fails
+    // with RETRY_EXC after about half a second by the spec (a few seconds
+    // measured on ConnectX-6), far inside kExchangeTimeout; the fault
+    // contract names it peer lost (TP2.md, Fault contract).
     attr.timeout = 14;
     attr.retry_cnt = 7;
     attr.rnr_retry = 7;
@@ -974,6 +997,7 @@ public:
       poisoned_ = true;
       if (first_error_.empty()) {
         first_error_ = "a GPU wait for a queued verbs exchange timed out";
+        NotifyPeerLocked();
       }
     }
     if (poisoned_) {
@@ -1097,8 +1121,23 @@ private:
     poisoned_ = true;
     if (first_error_.empty()) {
       first_error_ = message;
+      NotifyPeerLocked();
     }
     SetError(error, std::move(message));
+  }
+
+  /// The fault contract's first step (TP2.md): at this rank's first failure,
+  /// tell the peer why on the bootstrap socket, so the peer's wait ends now
+  /// instead of at its exchange deadline or when this process exits. A
+  /// failure that came from the peer is not sent back. Under `mutex_`.
+  void NotifyPeerLocked() {
+    if (peer_notified_ || control_ == nullptr || first_error_.empty() ||
+        distributed::IsPeerFaultMessage(first_error_)) {
+      return;
+    }
+    peer_notified_ = true;
+    (void)distributed::SendPoisonFrame(control_->fd(), config_.rank,
+                                       first_error_);
   }
 
   /// Reports a call on the poisoned communicator, under `mutex_`.
@@ -1429,6 +1468,7 @@ private:
           poisoned_ = true;
           if (first_error_.empty()) {
             first_error_ = finished.error;
+            NotifyPeerLocked();
           }
         }
         // Counted out before the GPU learns of the arrival, so a scope that
@@ -1481,6 +1521,12 @@ private:
     }
   }
 
+  /// Posts a receive for the peer's next write with immediate. The write
+  /// lands at its remote address; the receive only takes a queue slot and
+  /// yields the immediate, so it has no SGE. mlx5 note (TP2.md): never give
+  /// it a large one (other engines post 64 bytes) - a window-sized SGE
+  /// here costs receive-queue space and, on a striding receive queue,
+  /// overruns it.
   [[nodiscard]] bool PostReceive(std::string* error) {
     ibv_recv_wr wr{};
     ibv_recv_wr* bad = nullptr;
@@ -1529,8 +1575,14 @@ private:
                                     const ExpectedReceive& expected,
                                     bool* received, std::string* error) {
     if (completion.status != IBV_WC_SUCCESS) {
-      SetError(error, "verbs all-reduce completion failed with status " +
-                          std::to_string(completion.status));
+      // RETRY_EXC, RNR_RETRY_EXC, a flush and the remote errors are a lost
+      // peer; the rest are this rank's (TP2.md, Fault contract).
+      const auto fault = distributed::ClassifyCompletionStatus(
+          completion.status, ibv_wc_status_str(completion.status));
+      SetError(error, fault.kind == distributed::TpFaultKind::kLocal
+                          ? "verbs all-reduce completion failed with " +
+                                fault.reason
+                          : "verbs " + distributed::DescribeTpFault(fault));
       return false;
     }
     if (completion.opcode ==
@@ -1687,10 +1739,17 @@ private:
         return false;
       }
       if (fds[1].revents != 0) {
-        // The bootstrap socket carries nothing after setup; readable means
-        // the peer closed or reset it.
-        SetError(error, "verbs peer closed the bootstrap connection");
-        return false;
+        // After setup the bootstrap socket carries only the peer's poison
+        // frame (its first failure, with the reason). Otherwise readable
+        // means the peer closed or reset it, a killed rank within
+        // milliseconds, or its keepalive failed, a vanished host within
+        // about 25 s (TP2.md, Fault contract).
+        const auto fault =
+            distributed::ReadPeerFault(control_->fd(), kPoisonReadWait);
+        if (fault.kind != distributed::TpFaultKind::kNone) {
+          SetError(error, "verbs " + distributed::DescribeTpFault(fault));
+          return false;
+        }
       }
       if (fds[0].revents != 0) {
         ibv_cq* event_cq = nullptr;
@@ -1813,6 +1872,8 @@ private:
   bool poisoned_{false};
   // The first failure that poisoned the communicator.
   std::string first_error_;
+  // The poison frame went to the peer (once, at the first failure).
+  bool peer_notified_{false};
   // Started exchanges not yet finished, and queued exchanges not yet
   // complete.
   std::size_t started_{0};

@@ -30,6 +30,9 @@ add_qwen38_flash_next_test(continuation_layout gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(ngram gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(tp_partition gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(rdma_gid gufo_qwen38_flash_next "cpu")
+# The TP2 fault contract's host pieces: poison frame, peer-fault reads, a
+# killed peer process (TP2.md, "Fault contract").
+add_qwen38_flash_next_test(tp_fault gufo_qwen38_flash_next "cpu;tp2")
 add_qwen38_flash_next_test(mtp_sampling gufo_core "cpu")
 add_qwen38_flash_next_test(rope_scaling gufo_qwen38_flash_next "cpu")
 # The HF-oracle/off-bit-identity checks link the scalar model oracle, so

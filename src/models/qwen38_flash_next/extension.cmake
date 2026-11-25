@@ -13,6 +13,7 @@ gufo_extension_target(
     continuation_identity.cpp
     extension.cpp
     distributed/rdma_gid.cpp
+    distributed/tp_fault.cpp
     distributed/tp_partition.cpp
   LINK_LIBRARIES
     gufo_ext_runtime

@@ -501,7 +501,7 @@ target_link_libraries(gufo_ext_runtime PUBLIC gufo_json)
 
 if(NOT WIN32)
 add_library(gufo_tp_control STATIC src/cli/serve/tp_control.cpp
-  src/cli/serve/tp_bulk.cpp)
+  src/cli/serve/tp_bulk.cpp src/cli/serve/tp_preflight.cpp)
 target_include_directories(gufo_tp_control PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_features(gufo_tp_control PUBLIC cxx_std_20)
 target_link_libraries(gufo_tp_control PUBLIC gufo_core Threads::Threads)
@@ -988,6 +988,12 @@ endfunction()
   target_link_libraries(tp_control_test PRIVATE gufo_tp_control)
   add_test(NAME tp_control_test COMMAND tp_control_test)
   set_tests_properties(tp_control_test PROPERTIES LABELS "cpu;tp2" TIMEOUT 10)
+
+  # The TP2 rank preflight against fake sysfs trees (TP2.md, "Rank preflight").
+  add_executable(tp_preflight_test tests/cli/tp_preflight_test.cpp)
+  target_link_libraries(tp_preflight_test PRIVATE gufo_tp_control)
+  add_test(NAME tp_preflight_test COMMAND tp_preflight_test)
+  set_tests_properties(tp_preflight_test PROPERTIES LABELS "cpu;tp2" TIMEOUT 10)
 
   # A measurement, not a gate: it asserts no threshold and never fails on a
   # slow result, so it is labelled `perf` and kept out of the correctness run.

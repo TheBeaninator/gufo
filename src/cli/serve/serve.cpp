@@ -39,6 +39,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/cli/serve/tp_control.hpp"
+#include "src/cli/serve/tp_preflight.hpp"
 #include "src/cli/speculative_settings.hpp"
 #include "src/core/diagnostics/gpu_queues.h"
 #include "src/core/platform/shutdown_signal.hpp"
@@ -148,6 +149,9 @@ void ReportTerminationReason() {
 // Exit status after the GPU context is lost (EX_TEMPFAIL). Only a new process
 // recovers, so a supervisor must restart it.
 constexpr int kDeviceLostExitStatus = 75;
+// Exit status of a TP2 rank the preflight refused (EX_CONFIG): the host's
+// RDMA setup is wrong, and restarting the same command will not help.
+constexpr int kTpPreflightExitStatus = 78;
 // Deep snapshot captures and post-failure device probes legitimately hold
 // progress for tens of seconds.
 constexpr std::uint64_t kMinStallTimeoutMs = 60000;
@@ -1942,6 +1946,38 @@ int RunServe(std::span<const char* const> args) {
 #endif
     if (tp_world_size == 2) {
 #ifdef GUFO_ENABLE_TP2_RDMA
+      // Rank preflight (TP2.md): a rank whose RDMA device, port, GID, memory
+      // lock or uverbs node cannot pair refuses now, with every reason,
+      // instead of failing at the handshake after its model load.
+      if (const char* preflight_env = std::getenv("GUFO_TP2_PREFLIGHT");
+          preflight_env != nullptr && std::string(preflight_env) == "0") {
+        server::Logger::Warn("tp",
+                             "event=tp_preflight skipped=GUFO_TP2_PREFLIGHT=0");
+      } else {
+        const auto preflight = server::RunTpRdmaPreflight({
+            .device = tp_rdma_device,
+            .port = tp_rdma_port,
+            .gid_index = tp_gid_index < 0
+                             ? std::nullopt
+                             : std::optional<std::uint32_t>(
+                                   static_cast<std::uint32_t>(tp_gid_index)),
+        });
+        if (!preflight.ok) {
+          std::cerr << "Error: TP2 rank preflight refused rank " << tp_rank
+                    << " (" << preflight.Summary() << "):\n";
+          for (const auto& failure : preflight.failures) {
+            std::cerr << "  - " << failure << '\n';
+          }
+          std::cerr << "(GUFO_TP2_PREFLIGHT=0 skips this check)\n";
+          server::Logger::Error("tp", "event=tp_preflight_refused failures=" +
+                                          std::to_string(
+                                              preflight.failures.size()) +
+                                          " " + preflight.Summary());
+          return kTpPreflightExitStatus;
+        }
+        server::Logger::Info("tp",
+                             "event=tp_preflight ok " + preflight.Summary());
+      }
       std::string tp_error;
       tp_control =
           tp_rank == 0

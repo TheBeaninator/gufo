@@ -49,6 +49,25 @@ GID. `--tp-gid-index` overrides that, and is needed when the port has several
 candidates. Both ranks must use the same link layer. Each rank logs its choice as
 `event=rdma_ready`. RoCE v2 is qualified over USB4 only.
 
+### Rank preflight
+
+Before it opens the control channel or loads the model, a TP2 rank checks its
+host and refuses to start, naming every problem and exiting with status 78,
+when the pair could not form:
+
+- the RDMA device exists (the one `--tp-rdma-device` names, or the host's only
+  one) and its port is `ACTIVE`;
+- the GID it would use is set: on RoCE a RoCE v2 entry, chosen by the rule
+  above or by `--tp-gid-index` (the RoCE v2 entry of the link's IPv4 address
+  is usually index 3); on InfiniBand GID 0;
+- `RLIMIT_MEMLOCK` covers the 288 MiB of host windows (the 8 MiB default does
+  not, see the USB4 notes below; an ssh `ControlMaster` session that predates
+  a limits change keeps the old limit);
+- the device's `/dev/infiniband/uverbsN` exists and opens read-write.
+
+It reads sysfs and `/dev` only and logs `event=tp_preflight ok device=...
+gid_index=...`. `GUFO_TP2_PREFLIGHT=0` skips it.
+
 ### USB4
 
 Two Strix Halo hosts linked by USB4 cables can run TP2 without network cards:
@@ -388,6 +407,66 @@ a request that reuses what an unjudged request left fails too if rank 1 later
 rejects that request, however long that request stays open, and a rejected
 request's states and checkpoints are not reused.
 
+### Fault contract
+
+A pair fails as a pair, quickly, with the cause in both logs.
+
+1. **The first failure poisons, and the peer hears it.** A rank's first
+   failure (an exchange identity or size mismatch, a failed completion, a GPU
+   wait that timed out, a staging error) poisons its communicator: every
+   later call fails with that first reason. The rank also writes a 64-byte
+   poison frame (magic `GUPX`, its rank, the reason cut to 48 bytes) on the
+   bootstrap socket, which carries nothing else after setup, so the peer's
+   wait ends at once with `peer poisoned: rank N: <reason>` instead of at its
+   exchange deadline. A failure that came from the peer is not sent back.
+2. **A dead peer is seen within milliseconds to seconds.** An exchange that
+   sleeps on its completion channel also polls the bootstrap socket: a killed
+   rank's socket closes at once (`peer lost: the peer closed the bootstrap
+   connection`); a host that vanished fails the socket's keepalive (10 s idle,
+   3 probes 5 s apart: about 25 s). A write to a peer whose queue pair is gone
+   fails with RETRY_EXC after the QP's retries (timeout exponent 14, 7
+   retries: about half a second by the spec, a few seconds measured on
+   ConnectX-6). RETRY_EXC, RNR_RETRY_EXC, a flush and the remote errors read
+   `peer lost: completion status N (...)`; any other status is the rank's own
+   failure.
+3. **A live but stuck peer** is bounded by the exchange deadline (180 s; the
+   GPU-side wait gives up at 240 s). They stay long on purpose: a living peer
+   may fall far behind on a throttled SSD.
+4. **The ranks exit instead of hanging.** Rank 0 fails the request in flight;
+   a watcher sees the runner's failure within 200 ms and exits with status 1
+   a second later (`event=tp_pair_lost`), skipping a teardown that could wait
+   on the dead peer. Rank 1 exits with status 1 when its command channel or an
+   exchange fails (`event=tp_worker_failed`), and at once on SIGTERM. A
+   supervisor restarts both. During the load, a rank whose peer exits exits
+   too (`event=tp_peer_lost phase=load`).
+
+The prefixes `peer lost:` and `peer poisoned:` are stable; logs and checks
+match on them.
+
+### mlx5 notes
+
+What the verbs path does for mlx5 NICs (ConnectX-4 and later), as learned on a
+100 GbE ConnectX-6 RoCE fabric:
+
+- The receive for a write with immediate carries no data: the write lands at
+  its remote address, and the receive only takes a queue slot and yields the
+  immediate. It is posted without an SGE. Never give it a large one: a
+  window-sized SGE costs receive-queue space and overruns a striding receive
+  queue (an engine on that fabric posts 64 bytes). Device-window receives
+  (SEND_WITH_IMM) do carry the partial and keep their window-sized SGE.
+- Every send is signaled. The QP leaves `sq_sig_all` off, but each send sets
+  `IBV_SEND_SIGNALED`: mlx5 reaps send WQEs only when a signaled completion is
+  polled, so unsignaled sends fill the send queue.
+- One completion queue serves both queues and is sized to both depths
+  (16 + 16), so it cannot overrun; an overrun moves the QP to error. Separate
+  send and receive CQs work as well.
+- QP timeout exponent 14 with 7 retries: RETRY_EXC within seconds of a lost
+  peer (see Fault contract).
+- Lossless RoCE needs PFC on one priority, with ECN, on the switch and both
+  hosts. Do not change pause, PFC, MTU or DCB settings on a port with live RC
+  queue pairs: they do not survive the port reset, and neither rank
+  reconnects.
+
 ## Upstream integration, October 14, 2026
 
 The cache-integration branch and upstream main through `942999e7` are merged
@@ -438,6 +517,15 @@ chunk of its own.
 - `tp_peer_store_test` (label `tp2`, in the CPU suite): rank 1's store: loads
   in part, release with and without a disk tier, recovery, a corrupt disk
   entry, and eviction under pool and disk pressure.
+- `tp_preflight_test` (label `tp2`, in the CPU suite): the rank preflight
+  against fake sysfs trees: a healthy RoCE port, GID choice and refusals,
+  memlock, a port that is down reported with every other problem, device
+  choice, uverbs nodes, InfiniBand.
+- `qwen38_flash_next.tp_fault` (label `tp2`, in the CPU suite): the fault
+  contract's host pieces: the poison frame and its limits, a frame read by the
+  peer, a closed, partial or garbled bootstrap stream, completion status
+  names, and a peer process killed with SIGKILL seen within a second by a
+  rank waiting on its socket.
 - `qwen38_flash_next.tp_partition` and the attention, projection and routed
   operator tests: the split against the full kernels.
 - `qwen38_flash_next_tp_probe` (`gpu-tp2`): prompt, decode and logit
@@ -488,8 +576,10 @@ On both hosts, from one commit (record it and the binary hash):
    `tools/serving/check-continuation.py --restore` restores its greedy cases
    from disk with the same outputs.
 8. Killing rank 1 mid-request returns 500 promptly, and rank 0 then exits
-   with status 1; killing rank 0 makes rank 1 exit with status 1. SIGTERM
-   stops either rank promptly.
+   with status 1, its log naming the cause (`event=tp_pair_lost reason=...`);
+   killing rank 0 makes rank 1 exit with status 1. SIGTERM stops either rank
+   promptly. A rank started with an 8 MiB memlock limit refuses at the
+   preflight with status 78.
 9. For speed, report the median of several warm requests.
 
 ## Open
